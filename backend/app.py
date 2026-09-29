@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -49,7 +50,7 @@ if REQUIRE_NATIVE and native_processor is None:
 
 # Explicit dimension and pixel checks below provide deterministic API errors.
 Image.MAX_IMAGE_PIXELS = None
-_processing_slots = asyncio.Semaphore(MAX_CONCURRENCY)
+_processing_slots = threading.BoundedSemaphore(MAX_CONCURRENCY)
 
 
 class FilterName(str, Enum):
@@ -175,6 +176,11 @@ def _process_sync(contents: bytes, filter_name: FilterName, kernel_size: int) ->
     })
 
 
+def _process_sync_limited(contents: bytes, filter_name: FilterName, kernel_size: int) -> ProcessedImage:
+    with _processing_slots:
+        return _process_sync(contents, filter_name, kernel_size)
+
+
 def _headers(result: ProcessedImage, filter_name: FilterName, kernel_size: int) -> dict[str, str]:
     timing = result.timings_ms
     return {
@@ -199,8 +205,7 @@ async def _read_upload(file: UploadFile) -> bytes:
 async def _run(file: UploadFile, filter_name: FilterName, kernel_size: int | None) -> tuple[ProcessedImage, int]:
     kernel = _validate_kernel(filter_name, kernel_size)
     contents = await _read_upload(file)
-    async with _processing_slots:
-        result = await asyncio.to_thread(_process_sync, contents, filter_name, kernel)
+    result = await asyncio.to_thread(_process_sync_limited, contents, filter_name, kernel)
     return result, kernel
 
 
@@ -209,10 +214,17 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type"],
+    allow_methods=["GET", "POST", "PUT"],
+    allow_headers=["Authorization", "Content-Type"],
     expose_headers=["Server-Timing", "X-Processor-Backend", "X-Image-Width", "X-Image-Height", "X-Processing-Mode", "X-Kernel-Size", "Deprecation", "Sunset"],
 )
+
+# The clinical v3 surface is isolated from the legacy image-filter API so the
+# source DICOM path never mutates or reuses processed demo pixels.
+from clinical import initialize_clinical_store, router as clinical_router
+
+initialize_clinical_store()
+app.include_router(clinical_router)
 
 
 @app.exception_handler(ProcessorError)

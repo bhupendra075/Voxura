@@ -15,6 +15,7 @@ backend/out_*.png
 backend/headers_*.txt
 backend/test_input.png
 backend/benchmark-report.json
+backend/clinical_data/
 
 frontend/node_modules/
 frontend/dist/

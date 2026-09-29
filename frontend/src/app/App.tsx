@@ -1,579 +1,254 @@
-import { useState, useRef, useCallback, useEffect } from "react";
-import { Upload, Cpu, Zap, ImageIcon, AlertTriangle, ChevronDown, Loader2, SplitSquareHorizontal, BarChart3, Clock, Layers } from "lucide-react";
-import { API_BASE_URL, buildProcessFormData, errorMessage, parseServerTiming } from "./api";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  AlertTriangle, ArrowLeft, BrainCircuit, CheckCircle2, ChevronLeft, ChevronRight, CircleUserRound,
+  Columns2, Contrast, Crosshair, FileImage, FolderOpen, Grid2X2, Info, Loader2, Maximize,
+  MonitorCheck, Move, RefreshCw, RotateCw, Ruler, Save, Search, ShieldCheck, Upload,
+  ZoomIn, ZoomOut,
+} from "lucide-react";
+import { clinicalApi, isReviewChecklistComplete, type AiCapabilities, type AnalysisResults, type Instance, type PresentationState, type ReportDraft, type Series, type Study } from "./clinicalApi";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+const defaultState: PresentationState = {
+  layout: "1x1", active_series_id: null, active_instance_id: null, frame: 0,
+  window_center: null, window_width: null, zoom: 1, pan_x: 0, pan_y: 0,
+  rotation: 0, inverted: false, annotations: [],
+};
+const emptyDraft: ReportDraft = { version: 0, status: "empty", findings_text: "", impression_text: "", updated_by: null, updated_at: null };
+const emptyChecks = { patient_identity_confirmed: false, laterality_checked: false, priors_checked: false, critical_findings_checked: false, warnings_resolved: false };
 
-interface ProcessResult {
-  output_image: string; // base64 data URL
-  execution_time_ms: number;
-  total_time_ms: number;
-  backend: string;
-  width: number;
-  height: number;
+function displayDate(value: string) {
+  return value?.length === 8 ? `${value.slice(6, 8)} ${value.slice(4, 6)} ${value.slice(0, 4)}` : value || "—";
 }
 
-type FilterType = "box_blur" | "sobel_edge";
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function clamp(val: number, min: number, max: number) {
-  return Math.min(Math.max(val, min), max);
+function Badge({ children, tone = "slate" }: { children: React.ReactNode; tone?: "slate" | "green" | "amber" | "red" }) {
+  const colors = { slate: "border-slate-700 bg-slate-800 text-slate-200", green: "border-emerald-700 bg-emerald-950 text-emerald-300", amber: "border-amber-700 bg-amber-950 text-amber-300", red: "border-red-700 bg-red-950 text-red-300" };
+  return <span className={`rounded border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide ${colors[tone]}`}>{children}</span>;
 }
 
-function nearestOdd(n: number): number {
-  return n % 2 === 0 ? n + 1 : n;
+function EmptyViewer() {
+  return <div className="flex h-full flex-col items-center justify-center gap-3 text-slate-500">
+    <FileImage size={42} strokeWidth={1.25} />
+    <div className="text-center"><p className="text-sm font-semibold text-slate-300">No study selected</p><p className="mt-1 text-xs">Choose a study from the worklist or import DICOM files.</p></div>
+  </div>;
 }
-
-function formatNumber(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-  return n.toString();
-}
-
-// ─── Sub-components ───────────────────────────────────────────────────────────
-
-function TerminalLine({ label, value, accent = false, dim = false }: {
-  label: string;
-  value: string;
-  accent?: boolean;
-  dim?: boolean;
-}) {
-  return (
-    <div className="flex items-baseline gap-2 font-mono text-sm leading-relaxed">
-      <span className={`shrink-0 ${dim ? "text-[#3d4f63]" : "text-[#4a6070]"}`}>{label}</span>
-      <span className="flex-1 border-b border-dashed border-[#1a2a36] mb-[3px]" />
-      <span className={accent ? "text-emerald-400 font-semibold" : "text-[#8fa8bf]"}>{value}</span>
-    </div>
-  );
-}
-
-function StatCard({ icon: Icon, label, value, sub, color }: {
-  icon: React.ElementType;
-  label: string;
-  value: string;
-  sub: string;
-  color: string;
-}) {
-  return (
-    <div className="relative flex flex-col gap-2 rounded-lg border border-[rgba(99,102,241,0.12)] bg-[#0b1019] p-4 overflow-hidden">
-      <div className={`absolute top-0 left-0 h-[2px] w-full ${color}`} />
-      <div className="flex items-center gap-2">
-        <Icon size={14} className="text-muted-foreground" />
-        <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">{label}</span>
-      </div>
-      <p className="font-mono text-2xl font-semibold text-foreground leading-none">{value}</p>
-      <p className="font-mono text-xs text-muted-foreground">{sub}</p>
-    </div>
-  );
-}
-
-// ─── Image Comparison Slider ──────────────────────────────────────────────────
-
-function ComparisonSlider({ original, processed }: { original: string; processed: string }) {
-  const [splitPct, setSplitPct] = useState(50);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const dragging = useRef(false);
-
-  const handleMove = useCallback((clientX: number) => {
-    if (!containerRef.current) return;
-    const rect = containerRef.current.getBoundingClientRect();
-    const pct = clamp(((clientX - rect.left) / rect.width) * 100, 2, 98);
-    setSplitPct(pct);
-  }, []);
-
-  const onMouseDown = (e: React.MouseEvent) => {
-    dragging.current = true;
-    e.preventDefault();
-  };
-
-  useEffect(() => {
-    const onMove = (e: MouseEvent) => { if (dragging.current) handleMove(e.clientX); };
-    const onUp = () => { dragging.current = false; };
-    const onTouchMove = (e: TouchEvent) => { if (dragging.current) handleMove(e.touches[0].clientX); };
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-    window.addEventListener("touchmove", onTouchMove, { passive: true });
-    window.addEventListener("touchend", onUp);
-    return () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-      window.removeEventListener("touchmove", onTouchMove);
-      window.removeEventListener("touchend", onUp);
-    };
-  }, [handleMove]);
-
-  return (
-    <div
-      ref={containerRef}
-      className="relative w-full select-none overflow-hidden rounded-lg cursor-col-resize"
-      style={{ touchAction: "none" }}
-      onMouseDown={onMouseDown}
-      onTouchStart={(e) => { dragging.current = true; handleMove(e.touches[0].clientX); }}
-    >
-      {/* Processed (bottom layer, full width) */}
-      <img src={processed} alt="Processed" className="block w-full h-auto" draggable={false} />
-
-      {/* Original (clipped overlay) */}
-      <div
-        className="absolute inset-0 overflow-hidden"
-        style={{ width: `${splitPct}%` }}
-      >
-        <img src={original} alt="Original" className="block h-full w-auto max-w-none" draggable={false}
-          style={{ width: `${100 / (splitPct / 100)}%`, maxWidth: "none" }}
-        />
-      </div>
-
-      {/* Divider */}
-      <div
-        className="absolute inset-y-0 flex items-center justify-center"
-        style={{ left: `${splitPct}%`, transform: "translateX(-50%)" }}
-      >
-        <div className="w-[2px] h-full bg-emerald-400 opacity-90 shadow-[0_0_8px_#10b981]" />
-        <div className="absolute flex items-center justify-center w-8 h-8 rounded-full bg-emerald-400 shadow-[0_0_16px_#10b981] cursor-col-resize">
-          <SplitSquareHorizontal size={14} className="text-black" />
-        </div>
-      </div>
-
-      {/* Labels */}
-      <div className="absolute bottom-2 left-3 font-mono text-[10px] uppercase tracking-widest bg-black/60 text-emerald-400 px-2 py-0.5 rounded">
-        Original
-      </div>
-      <div className="absolute bottom-2 right-3 font-mono text-[10px] uppercase tracking-widest bg-black/60 text-indigo-400 px-2 py-0.5 rounded">
-        Processed
-      </div>
-    </div>
-  );
-}
-
-// ─── Main App ────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [isDragging, setIsDragging] = useState(false);
-  const [originalFile, setOriginalFile] = useState<File | null>(null);
-  const [originalURL, setOriginalURL] = useState<string | null>(null);
-  const [result, setResult] = useState<ProcessResult | null>(null);
-  const [filter, setFilter] = useState<FilterType>("box_blur");
-  const [kernelSize, setKernelSize] = useState(5);
-  const [isProcessing, setIsProcessing] = useState(false);
+  const [ready, setReady] = useState(false);
+  const [user, setUser] = useState("Radiologist");
+  const [pacs, setPacs] = useState({ configured: false, reachable: false, message: "Checking PACS…" });
+  const [studies, setStudies] = useState<Study[]>([]);
+  const [query, setQuery] = useState("");
+  const [selectedStudy, setSelectedStudy] = useState<Study | null>(null);
+  const [series, setSeries] = useState<Series[]>([]);
+  const [selectedSeries, setSelectedSeries] = useState<Series | null>(null);
+  const [instances, setInstances] = useState<Instance[]>([]);
+  const [instanceIndex, setInstanceIndex] = useState(0);
+  const [frame, setFrame] = useState(0);
+  const [imageUrl, setImageUrl] = useState<string | null>(null);
+  const [presentation, setPresentation] = useState<PresentationState>(defaultState);
+  const [report, setReport] = useState({ status: "unavailable", text: "No report is available for this study." });
+  const [capabilities, setCapabilities] = useState<AiCapabilities | null>(null);
+  const [analysis, setAnalysis] = useState<AnalysisResults>({ items: [], latest_job: null });
+  const [draft, setDraft] = useState<ReportDraft>(emptyDraft);
+  const [reviewChecks, setReviewChecks] = useState(emptyChecks);
+  const [activeTool, setActiveTool] = useState<"window" | "pan" | "length" | "angle" | "roi">("window");
+  const [rightPanel, setRightPanel] = useState<"assist" | "report" | "details" | "measurements">("assist");
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [importSummary, setImportSummary] = useState<string | null>(null);
+  const [showWorklist, setShowWorklist] = useState(true);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const dragOrigin = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
+  const savedPresentation = useRef<PresentationState>(defaultState);
+
+  const refreshStudies = useCallback(async (search = query) => {
+    const response = await clinicalApi.studies(search);
+    setStudies(response.items);
+  }, [query]);
 
   useEffect(() => {
-    return () => {
-      if (originalURL) URL.revokeObjectURL(originalURL);
-    };
-  }, [originalURL]);
+    void (async () => {
+      try {
+        const session = await clinicalApi.ensureDevelopmentSession();
+        setUser(session.display_name);
+        const [health, ai] = await Promise.all([clinicalApi.pacsHealth(), clinicalApi.aiCapabilities(), refreshStudies("")]);
+        setPacs(health);
+        setCapabilities(ai);
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : "Clinical service is unavailable");
+      } finally { setReady(true); }
+    })();
+  }, [refreshStudies]);
 
   useEffect(() => {
-    return () => {
-      if (result?.output_image) URL.revokeObjectURL(result.output_image);
-    };
-  }, [result]);
+    if (!selectedStudy) return;
+    setBusy(true); setError(null);
+    void Promise.all([clinicalApi.series(selectedStudy.id), clinicalApi.report(selectedStudy.id), clinicalApi.presentation(selectedStudy.id), clinicalApi.analysisResults(selectedStudy.id), clinicalApi.reportDraft(selectedStudy.id)])
+      .then(([seriesResponse, reportResponse, saved, analysisResponse, draftResponse]) => {
+        savedPresentation.current = saved;
+        setSeries(seriesResponse.items); setReport(reportResponse); setPresentation(saved); setAnalysis(analysisResponse); setDraft(draftResponse); setReviewChecks(emptyChecks);
+        const initial = seriesResponse.items.find((item) => item.id === saved.active_series_id) ?? seriesResponse.items[0] ?? null;
+        setSelectedSeries(initial); setShowWorklist(false);
+      }).catch((cause) => setError(cause instanceof Error ? cause.message : "Unable to open study"))
+      .finally(() => setBusy(false));
+  }, [selectedStudy]);
 
-  const pixelsPerSec =
-    result && result.execution_time_ms > 0
-      ? Math.round((result.width * result.height) / (result.execution_time_ms / 1000))
-      : null;
+  useEffect(() => {
+    if (!selectedStudy || !selectedSeries) { setInstances([]); return; }
+    setBusy(true);
+    void clinicalApi.metadata(selectedStudy.id, selectedSeries.id).then((metadata) => {
+      setInstances(metadata.instances);
+      const savedIndex = Math.max(0, metadata.instances.findIndex((item) => item.id === savedPresentation.current.active_instance_id));
+      setInstanceIndex(savedIndex); setFrame(savedIndex >= 0 ? savedPresentation.current.frame : 0);
+    }).catch((cause) => setError(cause instanceof Error ? cause.message : "Unable to load series"))
+      .finally(() => setBusy(false));
+  }, [selectedStudy, selectedSeries]);
 
-  // ── File handling ─────────────────────────────────────────────────────────
+  const currentInstance = instances[instanceIndex] ?? null;
+  useEffect(() => {
+    if (!currentInstance) { setImageUrl(null); return; }
+    let revoked = false;
+    void clinicalApi.frame(currentInstance.id, frame, presentation.window_center, presentation.window_width, presentation.inverted)
+      .then((blob) => { if (!revoked) setImageUrl((previous) => { if (previous) URL.revokeObjectURL(previous); return URL.createObjectURL(blob); }); })
+      .catch((cause) => setError(cause instanceof Error ? cause.message : "Unable to render frame"));
+    return () => { revoked = true; };
+  }, [currentInstance, frame, presentation.window_center, presentation.window_width, presentation.inverted]);
 
-  const loadFile = (file: File) => {
-    if (!file.type.startsWith("image/")) {
-      setError("File must be an image (PNG, JPEG, WebP, etc.).");
-      return;
-    }
-    setError(null);
-    setResult((prev) => {
-      if (prev?.output_image) URL.revokeObjectURL(prev.output_image);
-      return null;
-    });
-    setOriginalFile(file);
-    setOriginalURL((prev) => {
-      if (prev) URL.revokeObjectURL(prev);
-      return URL.createObjectURL(file);
-    });
+  useEffect(() => {
+    if (!selectedStudy || !selectedSeries || !currentInstance) return;
+    const next = { ...presentation, active_series_id: selectedSeries.id, active_instance_id: currentInstance.id, frame };
+    const timer = window.setTimeout(() => void clinicalApi.savePresentation(selectedStudy.id, next), 600);
+    return () => window.clearTimeout(timer);
+  }, [selectedStudy, selectedSeries, currentInstance, frame, presentation]);
+
+  const totalFrames = useMemo(() => instances.reduce((sum, item) => sum + item.frame_count, 0), [instances]);
+  const goSlice = (delta: number) => {
+    if (!currentInstance) return;
+    if (currentInstance.frame_count > 1) setFrame((value) => Math.min(currentInstance.frame_count - 1, Math.max(0, value + delta)));
+    else setInstanceIndex((value) => Math.min(instances.length - 1, Math.max(0, value + delta)));
   };
 
-  const onDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(false);
-    const file = e.dataTransfer.files[0];
-    if (file) loadFile(file);
-  };
-
-  const onFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) loadFile(file);
-  };
-
-  // ── Kernel slider (odd only) ──────────────────────────────────────────────
-
-  const handleKernelChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const raw = parseInt(e.target.value, 10);
-    setKernelSize(nearestOdd(raw));
-  };
-
-  // ── Process ───────────────────────────────────────────────────────────────
-
-  const processImage = async () => {
-    if (!originalFile) return;
-    setIsProcessing(true);
-    setError(null);
-    setResult((prev) => {
-      if (prev?.output_image) URL.revokeObjectURL(prev.output_image);
-      return null;
-    });
-
+  const handleImport = async (files: File[]) => {
+    if (!files.length) return;
+    setBusy(true); setError(null); setImportSummary(null);
     try {
-      const requestStart = performance.now();
-      const formData = buildProcessFormData(originalFile, filter, kernelSize);
-
-      const response = await fetch(`${API_BASE_URL}/v2/process`, {
-        method: "POST",
-        body: formData,
-      });
-
-      if (!response.ok) {
-        throw new Error(await errorMessage(response));
-      }
-
-      const timings = parseServerTiming(response.headers.get("Server-Timing"));
-      const requestTimeMs = performance.now() - requestStart;
-      const executionTimeMs = timings.process ?? requestTimeMs;
-
-      const imageBlob = await response.blob();
-      const processedUrl = URL.createObjectURL(imageBlob);
-
-      const bitmap = await createImageBitmap(imageBlob);
-      const width = bitmap.width;
-      const height = bitmap.height;
-      bitmap.close();
-
-      setResult({
-        output_image: processedUrl,
-        execution_time_ms: executionTimeMs,
-        total_time_ms: timings.total ?? requestTimeMs,
-        backend: response.headers.get("X-Processor-Backend") ?? "unknown",
-        width,
-        height,
-      });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "Unknown error";
-      if (msg.includes("Failed to fetch") || msg.includes("NetworkError")) {
-        setError(`Cannot reach the image service at ${API_BASE_URL}.`);
-      } else {
-        setError(msg);
-      }
-    } finally {
-      setIsProcessing(false);
-    }
+      const result = await clinicalApi.import(files);
+      setImportSummary(`${result.accepted.length} accepted · ${result.rejected.length} rejected`);
+      if (result.rejected.length) setError(result.rejected.slice(0, 2).map((item) => `${item.filename}: ${item.reason}`).join(" · "));
+      await refreshStudies("");
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Import failed"); }
+    finally { setBusy(false); }
   };
 
-  const filterLabel: Record<FilterType, string> = {
-    box_blur: "Box Blur",
-    sobel_edge: "Sobel Edge Detection",
+  const updatePresentation = (change: Partial<PresentationState>) => setPresentation((value) => ({ ...value, ...change }));
+  const runAnalysis = async () => {
+    if (!selectedStudy) return;
+    setBusy(true); setError(null);
+    try {
+      const latest_job = await clinicalApi.createAnalysis(selectedStudy.id);
+      setAnalysis((value) => ({ ...value, latest_job }));
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to qualify study"); }
+    finally { setBusy(false); }
+  };
+  const saveDraft = async () => {
+    if (!selectedStudy) return;
+    setBusy(true); setError(null);
+    try { setDraft(await clinicalApi.saveReportDraft(selectedStudy.id, draft)); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to save draft"); }
+    finally { setBusy(false); }
+  };
+  const reviewDraft = async () => {
+    if (!selectedStudy) return;
+    setBusy(true); setError(null);
+    try { setDraft(await clinicalApi.reviewReportDraft(selectedStudy.id, draft.version, reviewChecks)); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to mark draft reviewed"); }
+    finally { setBusy(false); }
+  };
+  const onPointerDown = (event: React.PointerEvent) => {
+    if (activeTool !== "pan") return;
+    dragOrigin.current = { x: event.clientX, y: event.clientY, panX: presentation.pan_x, panY: presentation.pan_y };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+  const onPointerMove = (event: React.PointerEvent) => {
+    if (!dragOrigin.current) return;
+    updatePresentation({ pan_x: dragOrigin.current.panX + event.clientX - dragOrigin.current.x, pan_y: dragOrigin.current.panY + event.clientY - dragOrigin.current.y });
   };
 
-  return (
-    <div
-      className="min-h-screen bg-background text-foreground"
-      style={{ fontFamily: "'Inter', sans-serif" }}
-    >
-      {/* ── Header ─────────────────────────────────────────────────────────── */}
-      <header className="sticky top-0 z-20 border-b border-[rgba(99,102,241,0.15)] bg-[#07090f]/90 backdrop-blur-md">
-        <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-3.5">
-          <div className="flex items-center gap-3">
-            <div className="flex h-8 w-8 items-center justify-center rounded-md bg-emerald-500/10 ring-1 ring-emerald-500/30">
-              <Cpu size={16} className="text-emerald-400" />
-            </div>
-            <div>
-              <h1 className="font-mono text-sm font-semibold tracking-tight text-foreground">
-                HyperImage Studio
-              </h1>
-              <p className="font-mono text-[10px] text-muted-foreground tracking-widest uppercase">
-                // Parallel Processing Dashboard
-              </p>
-            </div>
+  if (!ready) return <div className="flex min-h-screen items-center justify-center bg-slate-950 text-slate-200"><Loader2 className="mr-3 animate-spin" /> Initializing secure viewer…</div>;
+
+  return <div className="flex h-screen flex-col overflow-hidden bg-[#070a0e] text-slate-100">
+    <header className="flex h-14 shrink-0 items-center border-b border-slate-800 bg-[#0b1016] px-4">
+      <div className="flex items-center gap-3"><div className="rounded bg-cyan-500/15 p-1.5 text-cyan-300"><Crosshair size={20} /></div><div><h1 className="text-sm font-bold tracking-wide">MedScope Viewer</h1><p className="text-[10px] uppercase tracking-[.16em] text-slate-500">Clinical visualization aid · Not autonomous diagnosis</p></div></div>
+      <div className="ml-auto flex items-center gap-3">
+        <div className={`flex items-center gap-2 rounded border px-2.5 py-1 text-xs ${pacs.reachable ? "border-emerald-800 bg-emerald-950/50 text-emerald-300" : "border-amber-900 bg-amber-950/40 text-amber-300"}`}><span className={`h-1.5 w-1.5 rounded-full ${pacs.reachable ? "bg-emerald-400" : "bg-amber-400"}`} />{pacs.message}</div>
+        <div className="flex items-center gap-2 text-xs text-slate-300"><CircleUserRound size={17} /><span>{user}</span><Badge>Radiologist</Badge></div>
+      </div>
+    </header>
+
+    {selectedStudy && <div className="flex h-12 shrink-0 items-center gap-5 border-b border-cyan-950 bg-[#0d151d] px-4 text-xs">
+      <button onClick={() => setShowWorklist(true)} className="flex items-center gap-1.5 rounded px-2 py-1.5 text-slate-300 hover:bg-slate-800"><ArrowLeft size={15} /> Worklist</button>
+      <div><span className="text-slate-500">Patient</span><strong className="ml-2 text-sm text-white">{selectedStudy.patient_name}</strong></div>
+      <div><span className="text-slate-500">ID</span><strong className="ml-2">{selectedStudy.patient_id}</strong></div>
+      <div><span className="text-slate-500">DOB</span><strong className="ml-2">{displayDate(selectedStudy.birth_date)}</strong></div>
+      <div><span className="text-slate-500">Accession</span><strong className="ml-2">{selectedStudy.accession || "—"}</strong></div>
+      <div><span className="text-slate-500">Study</span><strong className="ml-2">{displayDate(selectedStudy.study_date)}</strong></div>
+      <Badge tone="green">{selectedStudy.modalities.replaceAll("\\", " · ")}</Badge>
+      <div className="ml-auto flex items-center gap-1.5 text-emerald-300"><ShieldCheck size={15} /> Source pixels immutable</div>
+    </div>}
+
+    {error && <div role="alert" className="flex shrink-0 items-center gap-2 border-b border-red-900 bg-red-950/80 px-4 py-2 text-xs text-red-200"><AlertTriangle size={15} /><span className="flex-1">{error}</span><button onClick={() => setError(null)} className="underline">Dismiss</button></div>}
+
+    <main className="min-h-0 flex-1">
+      {showWorklist || !selectedStudy ? <section className="h-full overflow-auto bg-slate-100 text-slate-950">
+        <div className="mx-auto max-w-7xl p-6">
+          <div className="mb-6 flex items-end justify-between"><div><h2 className="text-2xl font-semibold">Imaging worklist</h2><p className="mt-1 text-sm text-slate-600">Search local studies or connect an institutional DICOMweb archive.</p></div><div className="flex gap-2"><input ref={fileInput} type="file" accept=".dcm,application/dicom" multiple className="hidden" onChange={(event) => void handleImport(Array.from(event.target.files ?? []))} /><button onClick={() => fileInput.current?.click()} className="flex items-center gap-2 rounded bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700"><Upload size={16} /> Import DICOM</button></div></div>
+          <div className="mb-4 grid grid-cols-[1fr_auto_auto] gap-3 rounded-lg border border-slate-300 bg-white p-3 shadow-sm"><label className="relative"><Search className="absolute left-3 top-2.5 text-slate-400" size={18} /><input value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void refreshStudies(); }} placeholder="Patient name or ID" className="w-full rounded border border-slate-300 py-2 pl-10 pr-3 text-sm outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-100" /></label><button onClick={() => void refreshStudies()} className="rounded border border-slate-300 px-4 text-sm font-semibold hover:bg-slate-50">Search</button><button onClick={() => void refreshStudies("")} aria-label="Refresh worklist" className="rounded border border-slate-300 px-3 hover:bg-slate-50"><RefreshCw size={16} /></button></div>
+          {importSummary && <div className="mb-4 flex items-center gap-2 rounded border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm text-emerald-800"><CheckCircle2 size={16} /> Import complete: {importSummary}</div>}
+          <div className="overflow-hidden rounded-lg border border-slate-300 bg-white shadow-sm">
+            <table className="w-full text-left text-sm"><thead className="bg-slate-900 text-xs uppercase tracking-wide text-slate-300"><tr><th className="px-4 py-3">Patient</th><th>Study</th><th>Accession</th><th>Modality</th><th>Status</th><th className="pr-4 text-right">Open</th></tr></thead><tbody className="divide-y divide-slate-200">{studies.map((study) => <tr key={study.id} className="hover:bg-cyan-50"><td className="px-4 py-3"><strong className="block">{study.patient_name}</strong><span className="text-xs text-slate-500">{study.patient_id} · DOB {displayDate(study.birth_date)}</span></td><td><strong className="block font-medium">{study.description}</strong><span className="text-xs text-slate-500">{displayDate(study.study_date)}</span></td><td>{study.accession || "—"}</td><td><Badge>{study.modalities.replaceAll("\\", " · ")}</Badge></td><td><Badge tone={study.status === "unread" ? "amber" : "green"}>{study.status}</Badge></td><td className="pr-4 text-right"><button onClick={() => setSelectedStudy(study)} className="rounded bg-cyan-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-cyan-600">Review study</button></td></tr>)}</tbody></table>
+            {!studies.length && <div className="flex flex-col items-center gap-3 p-16 text-slate-500"><FolderOpen size={36} /><p className="font-semibold text-slate-700">No studies in this worklist</p><p className="text-sm">Import de-identified CR, DX, CT, or MR DICOM files to begin.</p></div>}
           </div>
-          <div className="flex items-center gap-2">
-            <span className="flex h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_6px_#10b981]" />
-            <span className="font-mono text-xs text-muted-foreground">system online</span>
+          <div className="mt-4 flex items-start gap-2 rounded border border-blue-200 bg-blue-50 p-3 text-xs text-blue-900"><Info size={16} className="mt-0.5 shrink-0" /> Clinical use requires institutional authorization, validated displays, security controls, and regional regulatory approval. Use de-identified studies during development.</div>
+        </div>
+      </section> : <section className="grid h-full min-h-0 grid-cols-[190px_minmax(0,1fr)_360px]">
+        <aside className="overflow-y-auto border-r border-slate-800 bg-[#0b1016] p-2"><p className="mb-2 px-2 text-[10px] font-semibold uppercase tracking-[.16em] text-slate-500">Series · {series.length}</p>{series.map((item) => <button key={item.id} onClick={() => setSelectedSeries(item)} className={`mb-2 w-full overflow-hidden rounded border text-left ${selectedSeries?.id === item.id ? "border-cyan-500 bg-cyan-950/30" : "border-slate-800 bg-slate-900 hover:border-slate-600"}`}><div className="flex h-20 items-center justify-center bg-black text-slate-600"><FileImage size={26} /><span className="ml-2 text-xs">{item.modality}</span></div><div className="p-2"><p className="truncate text-xs font-semibold text-slate-200">{item.series_number ?? "—"}. {item.description}</p><p className="mt-1 text-[10px] text-slate-500">{item.instance_count} instances · {item.frame_count} frames</p></div></button>)}</aside>
+
+        <div className="flex min-w-0 flex-col bg-black">
+          <div className="flex h-12 shrink-0 items-center gap-1 border-b border-slate-800 bg-[#0b1016] px-2">
+            {([ ["window", MonitorCheck, "W/L"], ["pan", Move, "Pan"], ["length", Ruler, "Length"], ["angle", Crosshair, "Angle"], ["roi", Maximize, "ROI"] ] as const).map(([tool, Icon, label]) => <button key={tool} onClick={() => setActiveTool(tool)} className={`flex h-9 items-center gap-1.5 rounded px-2.5 text-xs ${activeTool === tool ? "bg-cyan-700 text-white" : "text-slate-300 hover:bg-slate-800"}`}><Icon size={15} />{label}</button>)}
+            <span className="mx-1 h-6 w-px bg-slate-700" />
+            <button aria-label="Zoom out" onClick={() => updatePresentation({ zoom: Math.max(.1, presentation.zoom - .1) })} className="rounded p-2 hover:bg-slate-800"><ZoomOut size={16} /></button><button aria-label="Zoom in" onClick={() => updatePresentation({ zoom: Math.min(20, presentation.zoom + .1) })} className="rounded p-2 hover:bg-slate-800"><ZoomIn size={16} /></button><button aria-label="Rotate" onClick={() => updatePresentation({ rotation: ((presentation.rotation + 90) % 360) as PresentationState["rotation"] })} className="rounded p-2 hover:bg-slate-800"><RotateCw size={16} /></button><button aria-label="Invert" onClick={() => updatePresentation({ inverted: !presentation.inverted })} className={`rounded p-2 hover:bg-slate-800 ${presentation.inverted ? "bg-slate-700" : ""}`}><Contrast size={16} /></button><button onClick={() => setPresentation({ ...defaultState, active_series_id: selectedSeries?.id ?? null, active_instance_id: currentInstance?.id ?? null })} className="rounded px-2 py-1.5 text-xs text-slate-300 hover:bg-slate-800">Reset</button>
+            <div className="ml-auto flex gap-1"><button onClick={() => updatePresentation({ layout: "1x1" })} aria-label="Single viewport" className={`rounded p-2 ${presentation.layout === "1x1" ? "bg-cyan-800" : "hover:bg-slate-800"}`}><Maximize size={16} /></button><button onClick={() => updatePresentation({ layout: "1x2" })} aria-label="Two viewports" className={`rounded p-2 ${presentation.layout === "1x2" ? "bg-cyan-800" : "hover:bg-slate-800"}`}><Columns2 size={16} /></button><button onClick={() => updatePresentation({ layout: "2x2" })} aria-label="Four viewports" className={`rounded p-2 ${presentation.layout === "2x2" ? "bg-cyan-800" : "hover:bg-slate-800"}`}><Grid2X2 size={16} /></button></div>
           </div>
+          <div className={`grid min-h-0 flex-1 gap-px bg-slate-700 ${presentation.layout === "1x2" ? "grid-cols-2" : presentation.layout === "2x2" ? "grid-cols-2 grid-rows-2" : "grid-cols-1"}`}>{Array.from({ length: presentation.layout === "2x2" ? 4 : presentation.layout === "1x2" ? 2 : 1 }, (_, index) => <div key={index} className={`relative overflow-hidden bg-black ${index ? "opacity-70" : "ring-1 ring-inset ring-cyan-600"}`} onWheel={(event) => { event.preventDefault(); goSlice(event.deltaY > 0 ? 1 : -1); }} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={() => { dragOrigin.current = null; }}>
+            {index === 0 && imageUrl ? <img src={imageUrl} alt="Diagnostic DICOM viewport" draggable={false} className="h-full w-full select-none object-contain" style={{ transform: `translate(${presentation.pan_x}px, ${presentation.pan_y}px) scale(${presentation.zoom}) rotate(${presentation.rotation}deg)` }} /> : index === 0 ? <EmptyViewer /> : <div className="flex h-full items-center justify-center text-xs text-slate-600">Drop series here</div>}
+            <div className="pointer-events-none absolute left-3 top-3 text-[11px] leading-5 text-cyan-200 drop-shadow"><p>{selectedSeries?.modality} · {selectedSeries?.description}</p><p>{selectedSeries?.rows ?? "—"} × {selectedSeries?.columns ?? "—"}</p></div>
+            <div className="pointer-events-none absolute right-3 top-3 text-right text-[11px] leading-5 text-slate-300"><p>{selectedStudy.patient_name}</p><p>{selectedStudy.patient_id}</p></div>
+            <div className="pointer-events-none absolute bottom-3 left-3 text-[11px] text-slate-300"><p>W {presentation.window_width?.toFixed(0) ?? "DICOM"} / L {presentation.window_center?.toFixed(0) ?? "DICOM"}</p><p>Zoom {(presentation.zoom * 100).toFixed(0)}%</p></div>
+            <div className="pointer-events-none absolute bottom-3 right-3 text-[11px] text-slate-300">{currentInstance?.frame_count && currentInstance.frame_count > 1 ? `Frame ${frame + 1}/${currentInstance.frame_count}` : `Image ${instanceIndex + 1}/${instances.length || 0}`}</div>
+          </div>)}</div>
+          <div className="flex h-11 shrink-0 items-center border-t border-slate-800 bg-[#0b1016] px-3"><button onClick={() => goSlice(-1)} disabled={!currentInstance} className="rounded p-1.5 hover:bg-slate-800 disabled:opacity-30"><ChevronLeft size={18} /></button><input aria-label="Current image" type="range" min={0} max={Math.max(0, (currentInstance?.frame_count ?? 1) > 1 ? (currentInstance?.frame_count ?? 1) - 1 : instances.length - 1)} value={(currentInstance?.frame_count ?? 1) > 1 ? frame : instanceIndex} onChange={(event) => (currentInstance?.frame_count ?? 1) > 1 ? setFrame(Number(event.target.value)) : setInstanceIndex(Number(event.target.value))} className="mx-3 flex-1 accent-cyan-500" /><button onClick={() => goSlice(1)} disabled={!currentInstance} className="rounded p-1.5 hover:bg-slate-800 disabled:opacity-30"><ChevronRight size={18} /></button><span className="ml-3 min-w-24 text-right text-xs text-slate-400">{totalFrames} frames</span></div>
         </div>
-      </header>
 
-      {/* ── Main grid ──────────────────────────────────────────────────────── */}
-      <main className="mx-auto grid max-w-7xl gap-6 px-6 py-8 lg:grid-cols-[380px_1fr]">
-
-        {/* ── Left panel: controls ──────────────────────────────────────────── */}
-        <aside className="flex flex-col gap-5">
-
-          {/* Upload zone */}
-          <section className="rounded-xl border border-[rgba(99,102,241,0.15)] bg-card overflow-hidden">
-            <div className="flex items-center gap-2 border-b border-[rgba(99,102,241,0.1)] px-4 py-2.5">
-              <ImageIcon size={13} className="text-muted-foreground" />
-              <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">Input Image</span>
+        <aside className="min-h-0 border-l border-slate-800 bg-[#0b1016]"><div className="flex h-11 border-b border-slate-800">{(["assist", "report", "details", "measurements"] as const).map((tab) => <button key={tab} onClick={() => setRightPanel(tab)} className={`flex-1 text-[10px] font-semibold uppercase tracking-wide ${rightPanel === tab ? "border-b-2 border-cyan-500 text-cyan-300" : "text-slate-500 hover:text-slate-300"}`}>{tab}</button>)}</div><div className="h-[calc(100%-44px)] overflow-y-auto p-4 text-sm">
+          {rightPanel === "assist" && <div className="space-y-4">
+            <div className="flex items-center justify-between"><div className="flex items-center gap-2"><BrainCircuit size={18} className="text-cyan-300" /><h3 className="font-semibold">AI Assist</h3></div><Badge tone="amber">Not diagnostic</Badge></div>
+            <p className="text-xs leading-5 text-slate-400">Evidence-linked radiologist assistance only. Results never sign or finalize a report.</p>
+            <div className={`rounded border p-3 ${analysis.latest_job?.state === "abstained" ? "border-amber-900 bg-amber-950/30" : "border-slate-700 bg-slate-900"}`}>
+              <div className="flex items-center justify-between"><p className="text-xs font-semibold uppercase tracking-wide text-slate-300">Study readiness</p>{analysis.latest_job && <Badge tone={analysis.latest_job.state === "completed" ? "green" : analysis.latest_job.state === "failed" ? "red" : "amber"}>{analysis.latest_job.state}</Badge>}</div>
+              {analysis.latest_job ? <><p className="mt-2 text-xs leading-5 text-slate-300">{analysis.latest_job.message}</p><div className="mt-2 flex flex-wrap gap-1">{analysis.latest_job.manifest.sequences.length ? analysis.latest_job.manifest.sequences.map((sequence) => <Badge key={sequence}>{sequence}</Badge>) : <span className="text-xs text-amber-300">No MRI sequences identified from metadata</span>}</div>{analysis.latest_job.manifest.warnings.map((warning) => <p key={warning} className="mt-2 text-[11px] leading-4 text-amber-300">{warning}</p>)}</> : <p className="mt-2 text-xs text-slate-400">Run qualification to check modality, sequences, and enabled validated modules.</p>}
+              <button onClick={() => void runAnalysis()} className="mt-3 w-full rounded bg-cyan-700 px-3 py-2 text-xs font-semibold text-white hover:bg-cyan-600">Qualify study for analysis</button>
             </div>
-
-            <div className="p-4">
-              <div
-                onDragEnter={(e) => { e.preventDefault(); setIsDragging(true); }}
-                onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
-                onDragLeave={() => setIsDragging(false)}
-                onDrop={onDrop}
-                onClick={() => fileInputRef.current?.click()}
-                className={[
-                  "relative flex flex-col items-center justify-center gap-3 rounded-lg border-2 border-dashed cursor-pointer transition-all duration-200 min-h-[140px]",
-                  isDragging
-                    ? "border-emerald-400 bg-emerald-400/5 shadow-[0_0_20px_rgba(16,185,129,0.1)]"
-                    : "border-[rgba(99,102,241,0.2)] hover:border-[rgba(99,102,241,0.4)] bg-[#090d17] hover:bg-[#0c1020]",
-                ].join(" ")}
-              >
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="image/*"
-                  className="hidden"
-                  onChange={onFileChange}
-                />
-                {originalURL ? (
-                  <img
-                    src={originalURL}
-                    alt="Preview"
-                    className="max-h-48 w-full object-contain rounded"
-                  />
-                ) : (
-                  <>
-                    <div className={`flex h-10 w-10 items-center justify-center rounded-full border ${isDragging ? "border-emerald-400/50 bg-emerald-400/10" : "border-[rgba(99,102,241,0.2)] bg-[#111827]"}`}>
-                      <Upload size={18} className={isDragging ? "text-emerald-400" : "text-muted-foreground"} />
-                    </div>
-                    <div className="text-center">
-                      <p className="text-sm font-medium text-foreground">Drop image here</p>
-                      <p className="font-mono text-xs text-muted-foreground mt-0.5">or click to browse</p>
-                    </div>
-                    <span className="font-mono text-[10px] uppercase tracking-widest text-[#3a4a5a]">PNG · JPEG · WebP</span>
-                  </>
-                )}
-              </div>
-              {originalFile && (
-                <p className="mt-2 font-mono text-[11px] text-muted-foreground truncate">{originalFile.name} — {(originalFile.size / 1024).toFixed(1)} KB</p>
-              )}
-            </div>
-          </section>
-
-          {/* Controls */}
-          <section className="rounded-xl border border-[rgba(99,102,241,0.15)] bg-card overflow-hidden">
-            <div className="flex items-center gap-2 border-b border-[rgba(99,102,241,0.1)] px-4 py-2.5">
-              <Layers size={13} className="text-muted-foreground" />
-              <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">Processing Parameters</span>
-            </div>
-
-            <div className="flex flex-col gap-5 p-4">
-              {/* Filter select */}
-              <div>
-                <label className="mb-1.5 block font-mono text-xs text-muted-foreground uppercase tracking-wider">
-                  Algorithm
-                </label>
-                <div className="relative">
-                  <select
-                    value={filter}
-                    onChange={(e) => setFilter(e.target.value as FilterType)}
-                    className="w-full appearance-none rounded-lg border border-[rgba(99,102,241,0.2)] bg-[#0b1019] px-3 py-2.5 font-mono text-sm text-foreground focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 cursor-pointer transition-colors hover:border-[rgba(99,102,241,0.4)]"
-                  >
-                    <option value="box_blur">Box Blur</option>
-                    <option value="sobel_edge">Sobel Edge Detection</option>
-                  </select>
-                  <ChevronDown size={14} className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
-                </div>
-              </div>
-
-              {/* Kernel slider */}
-              {filter === "box_blur" && <div>
-                <div className="mb-1.5 flex items-center justify-between">
-                  <label className="font-mono text-xs text-muted-foreground uppercase tracking-wider">
-                    Kernel Size
-                  </label>
-                  <span className="font-mono text-sm font-semibold text-emerald-400">
-                    {kernelSize} × {kernelSize}
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min={3}
-                  max={21}
-                  step={2}
-                  value={kernelSize}
-                  onChange={handleKernelChange}
-                  className="w-full cursor-pointer accent-emerald-400"
-                  style={{
-                    accentColor: "#10b981",
-                  }}
-                />
-                <div className="mt-1 flex justify-between font-mono text-[10px] text-[#3a4a5a]">
-                  <span>3</span>
-                  <span>21</span>
-                </div>
-              </div>}
-
-              {/* Config summary */}
-              <div className="rounded-md bg-[#080c14] border border-[rgba(99,102,241,0.08)] p-3 space-y-1.5">
-                <TerminalLine label="filter" value={`"${filterLabel[filter]}"`} dim />
-                {filter === "box_blur" && <TerminalLine label="kernel" value={`${kernelSize}x${kernelSize}`} dim />}
-                <TerminalLine label="endpoint" value="/v2/process" dim />
-              </div>
-
-              {/* Process button */}
-              <button
-                onClick={processImage}
-                disabled={!originalFile || isProcessing}
-                className={[
-                  "relative flex items-center justify-center gap-2.5 rounded-lg px-4 py-3 font-mono text-sm font-semibold transition-all duration-200",
-                  !originalFile || isProcessing
-                    ? "cursor-not-allowed bg-[#0e1827] text-[#3a4a5a] border border-[rgba(99,102,241,0.1)]"
-                    : "cursor-pointer bg-emerald-500 text-black hover:bg-emerald-400 shadow-[0_0_20px_rgba(16,185,129,0.25)] hover:shadow-[0_0_30px_rgba(16,185,129,0.4)] active:scale-[0.98]",
-                ].join(" ")}
-              >
-                {isProcessing ? (
-                  <>
-                    <Loader2 size={15} className="animate-spin" />
-                    Processing…
-                  </>
-                ) : (
-                  <>
-                    <Zap size={15} />
-                    Process Image
-                  </>
-                )}
-              </button>
-
-              {/* Error */}
-              {error && (
-                <div className="flex gap-2.5 rounded-lg border border-red-500/20 bg-red-500/5 p-3">
-                  <AlertTriangle size={14} className="shrink-0 mt-0.5 text-red-400" />
-                  <p className="font-mono text-xs text-red-400 leading-relaxed">{error}</p>
-                </div>
-              )}
-            </div>
-          </section>
-        </aside>
-
-        {/* ── Right panel: workspace + analytics ───────────────────────────── */}
-        <div className="flex flex-col gap-5 min-w-0">
-
-          {/* Comparison workspace */}
-          <section className="rounded-xl border border-[rgba(99,102,241,0.15)] bg-card overflow-hidden">
-            <div className="flex items-center gap-2 border-b border-[rgba(99,102,241,0.1)] px-4 py-2.5">
-              <SplitSquareHorizontal size={13} className="text-muted-foreground" />
-              <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">Comparison Workspace</span>
-              {result && (
-                <span className="ml-auto font-mono text-[10px] text-emerald-400 bg-emerald-400/10 px-2 py-0.5 rounded-full border border-emerald-400/20">
-                  drag slider to compare
-                </span>
-              )}
-            </div>
-
-            <div className="p-4">
-              {result && originalURL ? (
-                <ComparisonSlider original={originalURL} processed={result.output_image} />
-              ) : (
-                <div className="flex h-64 flex-col items-center justify-center gap-3 rounded-lg bg-[#080c14] border border-[rgba(99,102,241,0.08)]">
-                  <div className="flex h-12 w-12 items-center justify-center rounded-full bg-[#0e1827] border border-[rgba(99,102,241,0.15)]">
-                    <SplitSquareHorizontal size={20} className="text-[#3a4a5a]" />
-                  </div>
-                  <div className="text-center">
-                    <p className="text-sm text-muted-foreground">No output yet</p>
-                    <p className="font-mono text-xs text-[#3a4a5a] mt-0.5">Upload an image and run processing</p>
-                  </div>
-                </div>
-              )}
-            </div>
-          </section>
-
-          {/* Performance analytics */}
-          <section className="rounded-xl border border-[rgba(99,102,241,0.15)] bg-card overflow-hidden">
-            <div className="flex items-center gap-2 border-b border-[rgba(99,102,241,0.1)] px-4 py-2.5">
-              <BarChart3 size={13} className="text-muted-foreground" />
-              <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">Performance Analytics</span>
-              <span className="ml-auto font-mono text-[10px] uppercase tracking-widest text-[#3a4a5a]">sys/monitor</span>
-            </div>
-
-            <div className="p-4">
-              {result ? (
-                <div className="flex flex-col gap-5">
-                  {/* Stat cards */}
-                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-                    <StatCard
-                      icon={Clock}
-                      label="Exec Time"
-                      value={`${result.execution_time_ms.toFixed(2)} ms`}
-                      sub="native filter time"
-                      color="bg-emerald-500"
-                    />
-                    <StatCard
-                      icon={ImageIcon}
-                      label="Resolution"
-                      value={`${result.width} × ${result.height}`}
-                      sub={`${(result.width * result.height / 1_000_000).toFixed(2)} megapixels`}
-                      color="bg-indigo-500"
-                    />
-                    <StatCard
-                      icon={Zap}
-                      label="Throughput"
-                      value={pixelsPerSec ? `${formatNumber(pixelsPerSec)} px/s` : "—"}
-                      sub="pixels processed per second"
-                      color="bg-amber-500"
-                    />
-                  </div>
-
-                  {/* Terminal breakdown */}
-                  <div className="rounded-lg bg-[#060a10] border border-[rgba(99,102,241,0.08)] p-4">
-                    <div className="mb-3 flex items-center gap-2">
-                      <span className="font-mono text-[10px] uppercase tracking-widest text-[#3a4a5a]">// execution report</span>
-                    </div>
-                    <div className="space-y-2">
-                      <TerminalLine label="filter_applied" value={`"${filterLabel[filter]}"`} accent />
-                      {filter === "box_blur" && <TerminalLine label="kernel_size" value={`${kernelSize}x${kernelSize}`} />}
-                      <TerminalLine label="backend" value={result.backend} />
-                      <TerminalLine label="image_width_px" value={result.width.toString()} />
-                      <TerminalLine label="image_height_px" value={result.height.toString()} />
-                      <TerminalLine label="total_pixels" value={formatNumber(result.width * result.height)} />
-                      <TerminalLine label="execution_time_ms" value={`${result.execution_time_ms.toFixed(3)}`} accent />
-                      <TerminalLine label="backend_total_ms" value={`${result.total_time_ms.toFixed(3)}`} />
-                      {pixelsPerSec && (
-                        <TerminalLine label="pixels_per_second" value={formatNumber(pixelsPerSec)} accent />
-                      )}
-                    </div>
-
-                    {/* Timing bar */}
-                    <div className="mt-4">
-                      <div className="mb-1.5 flex justify-between font-mono text-[10px] text-[#3a4a5a]">
-                        <span>execution_time</span>
-                        <span>{result.execution_time_ms.toFixed(2)} ms</span>
-                      </div>
-                      <div className="h-1.5 w-full overflow-hidden rounded-full bg-[#0e1827]">
-                        <div
-                          className="h-full rounded-full bg-emerald-400 transition-all duration-700 shadow-[0_0_8px_#10b981]"
-                          style={{
-                            width: `${clamp((result.execution_time_ms / 2000) * 100, 2, 100)}%`,
-                          }}
-                        />
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              ) : (
-                <div className="flex h-40 flex-col items-center justify-center gap-3">
-                  <div className="flex h-10 w-10 items-center justify-center rounded-full bg-[#0e1827] border border-[rgba(99,102,241,0.15)]">
-                    <BarChart3 size={18} className="text-[#3a4a5a]" />
-                  </div>
-                  <p className="font-mono text-xs text-[#3a4a5a]">awaiting process run…</p>
-                </div>
-              )}
-            </div>
-          </section>
-        </div>
-      </main>
-    </div>
-  );
+            <div className="rounded border border-slate-800 bg-slate-900 p-3"><p className="text-xs font-semibold uppercase tracking-wide text-slate-300">Validated coverage</p><div className="mt-2 space-y-2">{capabilities?.models.map((model) => <div key={model.id} className="border-t border-slate-800 pt-2 first:border-0 first:pt-0"><div className="flex items-start justify-between gap-2"><p className="text-xs font-medium text-slate-200">{model.display_name}</p><Badge tone={model.enabled ? "green" : "slate"}>{model.enabled ? "enabled" : model.status}</Badge></div><p className="mt-1 text-[11px] leading-4 text-slate-500">{model.intended_use}</p></div>)}</div></div>
+            <div className="rounded border border-slate-800 p-3"><div className="flex items-center justify-between"><p className="text-xs font-semibold uppercase tracking-wide text-slate-300">Proposed findings</p><span className="text-xs text-slate-500">{analysis.items.length}</span></div>{analysis.items.length ? <p className="mt-2 text-xs text-slate-300">Evidence results are available for clinician review.</p> : <div className="mt-2 rounded bg-slate-900 p-3 text-xs leading-5 text-slate-400">No validated model findings are available. This does <strong className="text-amber-300">not</strong> mean the study is normal.</div>}</div>
+            <div className="space-y-3 rounded border border-slate-800 p-3"><div className="flex items-center justify-between"><p className="text-xs font-semibold uppercase tracking-wide text-slate-300">Clinician draft</p><Badge tone={draft.status === "reviewed" ? "green" : draft.status === "draft" ? "amber" : "slate"}>{draft.status}</Badge></div><label className="block text-[11px] uppercase tracking-wide text-slate-500">Findings<textarea value={draft.findings_text} onChange={(event) => setDraft((value) => ({ ...value, findings_text: event.target.value, status: "draft" }))} rows={6} className="mt-1 w-full resize-y rounded border border-slate-700 bg-slate-950 p-2 text-xs normal-case tracking-normal text-slate-200 outline-none focus:border-cyan-600" placeholder="Enter reviewed, evidence-linked findings…" /></label><label className="block text-[11px] uppercase tracking-wide text-slate-500">Impression<textarea value={draft.impression_text} onChange={(event) => setDraft((value) => ({ ...value, impression_text: event.target.value, status: "draft" }))} rows={4} className="mt-1 w-full resize-y rounded border border-slate-700 bg-slate-950 p-2 text-xs normal-case tracking-normal text-slate-200 outline-none focus:border-cyan-600" placeholder="Enter a radiologist-reviewed impression…" /></label><button onClick={() => void saveDraft()} className="flex w-full items-center justify-center gap-2 rounded border border-cyan-800 px-3 py-2 text-xs font-semibold text-cyan-200 hover:bg-cyan-950"><Save size={14} />Save versioned draft</button></div>
+            {draft.version > 0 && draft.status !== "reviewed" && <div className="rounded border border-amber-900 bg-amber-950/20 p-3"><p className="text-xs font-semibold text-amber-200">Radiologist safety review</p><div className="mt-2 space-y-2">{([ ["patient_identity_confirmed", "Patient identity confirmed"], ["laterality_checked", "Laterality checked"], ["priors_checked", "Priors checked or unavailable"], ["critical_findings_checked", "Critical findings checked"], ["warnings_resolved", "Warnings resolved"] ] as const).map(([key, label]) => <label key={key} className="flex items-center gap-2 text-xs text-slate-300"><input type="checkbox" checked={reviewChecks[key]} onChange={(event) => setReviewChecks((value) => ({ ...value, [key]: event.target.checked }))} className="accent-cyan-500" />{label}</label>)}</div><button disabled={!isReviewChecklistComplete(reviewChecks)} onClick={() => void reviewDraft()} className="mt-3 w-full rounded bg-emerald-800 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-40">Mark reviewed — not signed</button></div>}
+          </div>}
+          {rightPanel === "report" && <><div className="mb-4 flex items-center justify-between"><h3 className="font-semibold">Radiology report</h3><Badge tone={report.status === "final" ? "green" : "slate"}>{report.status}</Badge></div><div className="whitespace-pre-wrap rounded border border-slate-800 bg-slate-900 p-3 text-sm leading-6 text-slate-300">{report.text}</div><p className="mt-3 text-xs text-slate-500">Read-only report context. This viewer does not generate findings.</p></>}
+          {rightPanel === "details" && <div className="space-y-4"><h3 className="font-semibold">Study details</h3>{[["Description", selectedStudy.description], ["Study date", displayDate(selectedStudy.study_date)], ["Accession", selectedStudy.accession || "—"], ["Modality", selectedStudy.modalities], ["Series", selectedSeries?.description ?? "—"], ["Laterality", selectedSeries?.laterality || "—"], ["Transfer syntax", currentInstance?.transfer_syntax || "—"]].map(([label, value]) => <div key={label} className="border-b border-slate-800 pb-2"><p className="text-[10px] uppercase tracking-wide text-slate-500">{label}</p><p className="mt-1 break-words text-slate-200">{value}</p></div>)}</div>}
+          {rightPanel === "measurements" && <div><h3 className="mb-4 font-semibold">Measurements</h3><div className="rounded border border-dashed border-slate-700 p-6 text-center text-xs text-slate-500"><Ruler className="mx-auto mb-2" size={24} />No saved measurements.<br />Select a calibrated tool to begin.</div><div className="mt-4 rounded border border-amber-900 bg-amber-950/30 p-3 text-xs text-amber-200"><AlertTriangle className="mr-2 inline" size={14} />Measurements require valid pixel spacing metadata.</div></div>}
+        </div></aside>
+      </section>}
+    </main>
+    {busy && <div className="pointer-events-none fixed inset-0 z-50 flex items-center justify-center bg-black/25"><div className="flex items-center gap-2 rounded bg-slate-900 px-4 py-3 text-sm shadow-xl"><Loader2 className="animate-spin text-cyan-400" size={18} /> Loading clinical data…</div></div>}
+  </div>;
 }
