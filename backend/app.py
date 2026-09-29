@@ -1,153 +1,275 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import Response
-from fastapi.middleware.cors import CORSMiddleware
-import numpy as np
-from PIL import Image
-import io
-import time
+from __future__ import annotations
 
-# Try to import the compiled C++ extension (pybind11 module). If not present, fall back to a pure-Python implementation.
-# The fallbacks operate on NumPy arrays in-place, preserving zero-copy semantics for the API.
-compiled_available = False
-cv2_available = False
+import asyncio
+import io
+import json
+import os
+import time
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any
+
+import numpy as np
+from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
+from PIL import Image, ImageOps, UnidentifiedImageError
+
 try:
-    import image_processor  # compiled extension
-    compiled_available = True
-except Exception:
-    image_processor = None
+    import image_processor as native_processor
+except ImportError:
+    native_processor = None
 
 try:
     import cv2
-    cv2_available = True
-except Exception:
+except ImportError:
     cv2 = None
 
-# Pure-Python fallback implementations (operate on NumPy arrays in-place)
-def box_blur_py(arr: np.ndarray, kernel_size: int) -> np.ndarray:
-    # Box blur using integral image. Works on padded image to handle borders.
-    h, w = arr.shape
-    k = kernel_size
-    r = k // 2
-    # Pad array so kernel fits at borders
-    padded = np.pad(arr, ((r, r), (r, r)), mode='edge').astype(np.uint32)
-    H, W = padded.shape
-    # integral image with extra zero row/col for simpler rectangle sums
-    integral = np.zeros((H + 1, W + 1), dtype=np.uint64)
-    integral[1:, 1:] = padded.cumsum(axis=0).cumsum(axis=1)
-    out = np.empty((h, w), dtype=np.uint8)
-    for y in range(h):
-        y1 = y
-        y2 = y + k - 1
-        for x in range(w):
-            x1 = x
-            x2 = x + k - 1
-            total = integral[y2 + 1, x2 + 1] - integral[y1, x2 + 1] - integral[y2 + 1, x1] + integral[y1, x1]
-            out[y, x] = total // (k * k)
-    return out
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    value = int(os.getenv(name, str(default)))
+    if value < minimum:
+        raise RuntimeError(f"{name} must be >= {minimum}")
+    return value
 
 
-def sobel_edge_py(arr: np.ndarray) -> np.ndarray:
-    # Naive Sobel using convolution (3x3). Returns uint8 array.
-    h, w = arr.shape
-    out = np.zeros_like(arr, dtype=np.uint8)
-    Gx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.int32)
-    Gy = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.int32)
-    padded = np.pad(arr, ((1,1),(1,1)), mode='edge').astype(np.int32)
-    mag = np.zeros((h,w), dtype=np.float32)
-    for y in range(1, h+1):
-        for x in range(1, w+1):
-            region = padded[y-1:y+2, x-1:x+2]
-            gx = np.sum(region * Gx)
-            gy = np.sum(region * Gy)
-            mag[y-1, x-1] = np.sqrt(gx*gx + gy*gy)
-    maxv = mag.max()
-    if maxv > 0:
-        out = np.clip((mag / maxv) * 255.0, 0, 255).astype(np.uint8)
-    return out
+MAX_UPLOAD_BYTES = _env_int("PROCESSOR_MAX_UPLOAD_BYTES", 20 * 1024 * 1024)
+MAX_DIMENSION = _env_int("PROCESSOR_MAX_DIMENSION", 8192)
+MAX_MEGAPIXELS = _env_int("PROCESSOR_MAX_MEGAPIXELS", 40)
+MAX_KERNEL_SIZE = _env_int("PROCESSOR_MAX_KERNEL_SIZE", 101, 3)
+MAX_CONCURRENCY = _env_int("PROCESSOR_MAX_CONCURRENCY", 2)
+REQUIRE_NATIVE = os.getenv("PROCESSOR_REQUIRE_NATIVE", "0").lower() in {"1", "true", "yes"}
+ALLOWED_ORIGINS = [value.strip() for value in os.getenv(
+    "PROCESSOR_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
+).split(",") if value.strip()]
 
-app = FastAPI(title="High-Performance Image Processor")
+if REQUIRE_NATIVE and native_processor is None:
+    raise RuntimeError("PROCESSOR_REQUIRE_NATIVE is enabled, but image_processor could not be imported")
+
+# Explicit dimension and pixel checks below provide deterministic API errors.
+Image.MAX_IMAGE_PIXELS = None
+_processing_slots = asyncio.Semaphore(MAX_CONCURRENCY)
+
+
+class FilterName(str, Enum):
+    box_blur = "box_blur"
+    sobel = "sobel"
+
+
+class ProcessorError(Exception):
+    def __init__(self, status: int, code: str, message: str):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+
+
+@dataclass(frozen=True)
+class ProcessedImage:
+    png: bytes
+    width: int
+    height: int
+    backend: str
+    timings_ms: dict[str, float]
+
+
+def box_blur_reference(arr: np.ndarray, kernel_size: int) -> np.ndarray:
+    radius = kernel_size // 2
+    padded = np.pad(arr, ((radius, radius), (radius, radius)), mode="edge").astype(np.uint64)
+    integral = np.pad(padded, ((1, 0), (1, 0))).cumsum(0).cumsum(1)
+    sums = (
+        integral[kernel_size:, kernel_size:]
+        - integral[:-kernel_size, kernel_size:]
+        - integral[kernel_size:, :-kernel_size]
+        + integral[:-kernel_size, :-kernel_size]
+    )
+    return ((sums + (kernel_size * kernel_size) // 2) // (kernel_size * kernel_size)).astype(np.uint8)
+
+
+def sobel_reference(arr: np.ndarray) -> np.ndarray:
+    padded = np.pad(arr.astype(np.int32), 1, mode="edge")
+    p00, p01, p02 = padded[:-2, :-2], padded[:-2, 1:-1], padded[:-2, 2:]
+    p10, p12 = padded[1:-1, :-2], padded[1:-1, 2:]
+    p20, p21, p22 = padded[2:, :-2], padded[2:, 1:-1], padded[2:, 2:]
+    gx = -p00 + p02 - 2 * p10 + 2 * p12 - p20 + p22
+    gy = -p00 - 2 * p01 - p02 + p20 + 2 * p21 + p22
+    squared = gx.astype(np.int64) ** 2 + gy.astype(np.int64) ** 2
+    maximum = int(squared.max(initial=0))
+    if maximum == 0:
+        return np.zeros_like(arr)
+    scale = 255.0 / np.sqrt(maximum)
+    return np.clip(np.sqrt(squared) * scale + 0.5, 0, 255).astype(np.uint8)
+
+
+# Backward-compatible names used by older scripts.
+box_blur_py = box_blur_reference
+sobel_edge_py = sobel_reference
+
+
+def _validate_kernel(filter_name: FilterName, kernel_size: int | None) -> int:
+    if filter_name is FilterName.sobel:
+        return 3
+    if kernel_size is None:
+        raise ProcessorError(422, "missing_kernel_size", "kernel_size is required for box_blur")
+    if kernel_size < 3 or kernel_size > MAX_KERNEL_SIZE or kernel_size % 2 == 0:
+        raise ProcessorError(422, "invalid_kernel_size", f"kernel_size must be odd and between 3 and {MAX_KERNEL_SIZE}")
+    return kernel_size
+
+
+def _decode(contents: bytes) -> np.ndarray:
+    try:
+        with Image.open(io.BytesIO(contents)) as source:
+            width, height = source.size
+            if width <= 0 or height <= 0 or width > MAX_DIMENSION or height > MAX_DIMENSION:
+                raise ProcessorError(413, "image_dimensions_exceeded", f"image dimensions must not exceed {MAX_DIMENSION}x{MAX_DIMENSION}")
+            if width * height > MAX_MEGAPIXELS * 1_000_000:
+                raise ProcessorError(413, "image_pixels_exceeded", f"image must not exceed {MAX_MEGAPIXELS} megapixels")
+            image = ImageOps.exif_transpose(source).convert("L")
+            return np.array(image, dtype=np.uint8, copy=True, order="C")
+    except ProcessorError:
+        raise
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise ProcessorError(400, "invalid_image", "The uploaded file is not a supported image") from exc
+
+
+def _apply_filter(arr: np.ndarray, filter_name: FilterName, kernel_size: int) -> str:
+    if native_processor is not None:
+        if filter_name is FilterName.box_blur:
+            native_processor.box_blur(arr, kernel_size)
+        else:
+            native_processor.sobel_edge(arr)
+        return "native-openmp" if native_processor.openmp_enabled() else "native"
+    if cv2 is not None:
+        if filter_name is FilterName.box_blur:
+            arr[:] = cv2.blur(arr, (kernel_size, kernel_size), borderType=cv2.BORDER_REPLICATE)
+        else:
+            # The reference implementation defines exact normalization and border behavior.
+            arr[:] = sobel_reference(arr)
+        return "opencv"
+    if filter_name is FilterName.box_blur:
+        arr[:] = box_blur_reference(arr, kernel_size)
+    else:
+        arr[:] = sobel_reference(arr)
+    return "numpy"
+
+
+def _process_sync(contents: bytes, filter_name: FilterName, kernel_size: int) -> ProcessedImage:
+    total_start = time.perf_counter()
+    start = time.perf_counter()
+    arr = _decode(contents)
+    decode_ms = (time.perf_counter() - start) * 1000
+    height, width = arr.shape
+
+    start = time.perf_counter()
+    backend = _apply_filter(arr, filter_name, kernel_size)
+    process_ms = (time.perf_counter() - start) * 1000
+
+    start = time.perf_counter()
+    output = io.BytesIO()
+    Image.fromarray(arr).save(output, format="PNG", optimize=False)
+    encode_ms = (time.perf_counter() - start) * 1000
+    total_ms = (time.perf_counter() - total_start) * 1000
+    return ProcessedImage(output.getvalue(), width, height, backend, {
+        "decode": decode_ms, "process": process_ms, "encode": encode_ms, "total": total_ms,
+    })
+
+
+def _headers(result: ProcessedImage, filter_name: FilterName, kernel_size: int) -> dict[str, str]:
+    timing = result.timings_ms
+    return {
+        "Server-Timing": ", ".join(f"{name};dur={duration:.3f}" for name, duration in timing.items()),
+        "X-Processor-Backend": result.backend,
+        "X-Image-Width": str(result.width),
+        "X-Image-Height": str(result.height),
+        "X-Processing-Mode": filter_name.value,
+        "X-Kernel-Size": str(kernel_size),
+    }
+
+
+async def _read_upload(file: UploadFile) -> bytes:
+    contents = await file.read(MAX_UPLOAD_BYTES + 1)
+    if not contents:
+        raise ProcessorError(400, "empty_upload", "The uploaded file is empty")
+    if len(contents) > MAX_UPLOAD_BYTES:
+        raise ProcessorError(413, "upload_too_large", f"Upload must not exceed {MAX_UPLOAD_BYTES} bytes")
+    return contents
+
+
+async def _run(file: UploadFile, filter_name: FilterName, kernel_size: int | None) -> tuple[ProcessedImage, int]:
+    kernel = _validate_kernel(filter_name, kernel_size)
+    contents = await _read_upload(file)
+    async with _processing_slots:
+        result = await asyncio.to_thread(_process_sync, contents, filter_name, kernel)
+    return result, kernel
+
+
+app = FastAPI(title="High-Performance Image Processor", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["X-Processing-Metrics"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+    expose_headers=["Server-Timing", "X-Processor-Backend", "X-Image-Width", "X-Image-Height", "X-Processing-Mode", "X-Kernel-Size", "Deprecation", "Sunset"],
 )
 
 
-@app.post("/process")
-async def process_image(
+@app.exception_handler(ProcessorError)
+async def processor_error_handler(_: Request, exc: ProcessorError) -> JSONResponse:
+    return JSONResponse(status_code=exc.status, content={"error": {"code": exc.code, "message": exc.message}})
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+    fields = [".".join(str(part) for part in error["loc"] if part != "body") for error in exc.errors()]
+    return JSONResponse(status_code=422, content={"error": {
+        "code": "validation_error",
+        "message": "Invalid request fields",
+        "fields": fields,
+    }})
+
+
+@app.get("/v2/capabilities")
+def capabilities() -> dict[str, Any]:
+    native = native_processor is not None
+    return {
+        "api_version": "v2",
+        "filters": [item.value for item in FilterName],
+        "backend": "native-openmp" if native and native_processor.openmp_enabled() else ("native" if native else ("opencv" if cv2 is not None else "numpy")),
+        "native_available": native,
+        "openmp_available": bool(native and native_processor.openmp_enabled()),
+        "openmp_max_threads": native_processor.openmp_max_threads() if native else 0,
+        "limits": {"upload_bytes": MAX_UPLOAD_BYTES, "dimension": MAX_DIMENSION, "megapixels": MAX_MEGAPIXELS, "kernel_size": MAX_KERNEL_SIZE, "concurrency": MAX_CONCURRENCY},
+    }
+
+
+@app.post("/v2/process")
+async def process_v2(
+    file: UploadFile = File(...),
+    filter: FilterName = Form(...),
+    kernel_size: int | None = Form(None),
+) -> Response:
+    result, kernel = await _run(file, filter, kernel_size)
+    return Response(result.png, media_type="image/png", headers=_headers(result, filter, kernel))
+
+
+@app.post("/process", deprecated=True)
+async def process_legacy(
     file: UploadFile = File(...),
     filter_type: str = Form("blur"),
     kernel_size: int = Form(3),
-):
-    """
-    Accept an uploaded image, apply either 'blur' or 'sobel' filter using the C++ extension.
-
-    The NumPy array is passed directly to the pybind11 extension without copying (zero-copy) by
-    ensuring a C-contiguous uint8 NumPy array is provided. The C++ code accesses/modifies the
-    array memory in-place via the buffer protocol, avoiding expensive data copies.
-    """
-    contents = await file.read()
-    try:
-        img = Image.open(io.BytesIO(contents)).convert("L")  # convert to grayscale
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
-
-    arr = np.array(img, dtype=np.uint8)
-    # Ensure contiguous layout for zero-copy buffer sharing
-    arr = np.ascontiguousarray(arr)
-
-    # Validate inputs
-    filter_type = filter_type.lower()
-    if filter_type not in ("blur", "sobel"):
-        raise HTTPException(status_code=400, detail="filter_type must be 'blur' or 'sobel'")
-
-    if filter_type == "blur":
-        if kernel_size < 3 or kernel_size % 2 == 0:
-            raise HTTPException(status_code=400, detail="kernel_size must be odd and >= 3")
-
-    # Call into C++ extension if available, otherwise use the Python fallback.
-    start = time.perf_counter()
-    if compiled_available:
-        if filter_type == "blur":
-            # Zero-copy: pass the NumPy array directly. pybind11's py::array_t maps to the buffer
-            # and the C++ code modifies arr in-place without copying.
-            image_processor.box_blur(arr, int(kernel_size))
-        else:
-            image_processor.sobel_edge(arr)
-    else:
-        # Use OpenCV if available for better performance, otherwise use pure NumPy fallbacks.
-        if filter_type == "blur":
-            if cv2_available:
-                out = cv2.blur(arr, (kernel_size, kernel_size))
-                arr[:] = out
-            else:
-                arr[:] = box_blur_py(arr, kernel_size)
-        else:
-            if cv2_available:
-                gx = cv2.Sobel(arr, cv2.CV_32F, 1, 0, ksize=3)
-                gy = cv2.Sobel(arr, cv2.CV_32F, 0, 1, ksize=3)
-                mag = np.sqrt(gx * gx + gy * gy)
-                maxv = mag.max()
-                if maxv > 0:
-                    mag = (mag / maxv * 255.0).astype(np.uint8)
-                else:
-                    mag = np.zeros_like(arr)
-                arr[:] = mag
-            else:
-                arr[:] = sobel_edge_py(arr)
-    elapsed = time.perf_counter() - start
-
-    # Convert back to PNG bytes
-    out_img = Image.fromarray(arr)
-    buf = io.BytesIO()
-    out_img.save(buf, format="PNG")
-    png_bytes = buf.getvalue()
-
-    # Performance metrics header (also included in a JSON body if desired)
-    perf = {"c_function_seconds": elapsed, "filter": filter_type, "kernel_size": kernel_size}
-    headers = {"X-Processing-Metrics": str(perf)}
-
-    return Response(content=png_bytes, media_type="image/png", headers=headers)
+) -> Response:
+    mapping = {"blur": FilterName.box_blur, "box_blur": FilterName.box_blur, "sobel": FilterName.sobel, "sobel_edge": FilterName.sobel}
+    filter_name = mapping.get(filter_type.lower())
+    if filter_name is None:
+        raise ProcessorError(422, "invalid_filter", "filter_type must be blur or sobel")
+    result, kernel = await _run(file, filter_name, kernel_size)
+    headers = _headers(result, filter_name, kernel)
+    headers.update({
+        "Deprecation": "true",
+        "Sunset": "Wed, 31 Dec 2026 23:59:59 GMT",
+        "Link": '</v2/process>; rel="successor-version"',
+        "X-Processing-Metrics": json.dumps({"c_function_seconds": result.timings_ms["process"] / 1000, "filter": filter_type, "kernel_size": kernel}),
+    })
+    return Response(result.png, media_type="image/png", headers=headers)

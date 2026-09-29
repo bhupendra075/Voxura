@@ -1,11 +1,14 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { Upload, Cpu, Zap, ImageIcon, AlertTriangle, ChevronDown, Loader2, SplitSquareHorizontal, BarChart3, Clock, Layers } from "lucide-react";
+import { API_BASE_URL, buildProcessFormData, errorMessage, parseServerTiming } from "./api";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface ProcessResult {
   output_image: string; // base64 data URL
   execution_time_ms: number;
+  total_time_ms: number;
+  backend: string;
   width: number;
   height: number;
 }
@@ -26,24 +29,6 @@ function formatNumber(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
   return n.toString();
-}
-
-function parseExecutionTimeMs(header: string | null): number | null {
-  if (!header) return null;
-
-  try {
-    const parsed = JSON.parse(header) as { c_function_seconds?: number };
-    if (typeof parsed.c_function_seconds === "number") {
-      return parsed.c_function_seconds * 1000;
-    }
-  } catch {
-    // FastAPI currently sends a Python-dict-like string, so JSON parsing may fail.
-  }
-
-  const match = header.match(/c_function_seconds['"]?\s*:\s*([0-9.+\-eE]+)/);
-  if (!match) return null;
-  const seconds = Number.parseFloat(match[1]);
-  return Number.isFinite(seconds) ? seconds * 1000 : null;
 }
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
@@ -242,24 +227,20 @@ export default function App() {
 
     try {
       const requestStart = performance.now();
-      const formData = new FormData();
-      formData.append("file", originalFile);
-      formData.append("filter_type", filter === "box_blur" ? "blur" : "sobel");
-      formData.append("kernel_size", kernelSize.toString());
+      const formData = buildProcessFormData(originalFile, filter, kernelSize);
 
-      const response = await fetch("http://localhost:8000/process", {
+      const response = await fetch(`${API_BASE_URL}/v2/process`, {
         method: "POST",
         body: formData,
       });
 
       if (!response.ok) {
-        const text = await response.text();
-        throw new Error(`Server returned ${response.status}: ${text}`);
+        throw new Error(await errorMessage(response));
       }
 
-      const processingHeader = response.headers.get("X-Processing-Metrics");
-      const executionTimeMs =
-        parseExecutionTimeMs(processingHeader) ?? (performance.now() - requestStart);
+      const timings = parseServerTiming(response.headers.get("Server-Timing"));
+      const requestTimeMs = performance.now() - requestStart;
+      const executionTimeMs = timings.process ?? requestTimeMs;
 
       const imageBlob = await response.blob();
       const processedUrl = URL.createObjectURL(imageBlob);
@@ -272,13 +253,15 @@ export default function App() {
       setResult({
         output_image: processedUrl,
         execution_time_ms: executionTimeMs,
+        total_time_ms: timings.total ?? requestTimeMs,
+        backend: response.headers.get("X-Processor-Backend") ?? "unknown",
         width,
         height,
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Unknown error";
       if (msg.includes("Failed to fetch") || msg.includes("NetworkError")) {
-        setError("Cannot reach backend at localhost:8000. Make sure the server is running.");
+        setError(`Cannot reach the image service at ${API_BASE_URL}.`);
       } else {
         setError(msg);
       }
@@ -406,7 +389,7 @@ export default function App() {
               </div>
 
               {/* Kernel slider */}
-              <div>
+              {filter === "box_blur" && <div>
                 <div className="mb-1.5 flex items-center justify-between">
                   <label className="font-mono text-xs text-muted-foreground uppercase tracking-wider">
                     Kernel Size
@@ -431,13 +414,13 @@ export default function App() {
                   <span>3</span>
                   <span>21</span>
                 </div>
-              </div>
+              </div>}
 
               {/* Config summary */}
               <div className="rounded-md bg-[#080c14] border border-[rgba(99,102,241,0.08)] p-3 space-y-1.5">
                 <TerminalLine label="filter" value={`"${filterLabel[filter]}"`} dim />
-                <TerminalLine label="kernel" value={`${kernelSize}x${kernelSize}`} dim />
-                <TerminalLine label="endpoint" value="localhost:8000/process" dim />
+                {filter === "box_blur" && <TerminalLine label="kernel" value={`${kernelSize}x${kernelSize}`} dim />}
+                <TerminalLine label="endpoint" value="/v2/process" dim />
               </div>
 
               {/* Process button */}
@@ -524,7 +507,7 @@ export default function App() {
                       icon={Clock}
                       label="Exec Time"
                       value={`${result.execution_time_ms.toFixed(2)} ms`}
-                      sub="backend wall-clock time"
+                      sub="native filter time"
                       color="bg-emerald-500"
                     />
                     <StatCard
@@ -550,11 +533,13 @@ export default function App() {
                     </div>
                     <div className="space-y-2">
                       <TerminalLine label="filter_applied" value={`"${filterLabel[filter]}"`} accent />
-                      <TerminalLine label="kernel_size" value={`${kernelSize}x${kernelSize}`} />
+                      {filter === "box_blur" && <TerminalLine label="kernel_size" value={`${kernelSize}x${kernelSize}`} />}
+                      <TerminalLine label="backend" value={result.backend} />
                       <TerminalLine label="image_width_px" value={result.width.toString()} />
                       <TerminalLine label="image_height_px" value={result.height.toString()} />
                       <TerminalLine label="total_pixels" value={formatNumber(result.width * result.height)} />
                       <TerminalLine label="execution_time_ms" value={`${result.execution_time_ms.toFixed(3)}`} accent />
+                      <TerminalLine label="backend_total_ms" value={`${result.total_time_ms.toFixed(3)}`} />
                       {pixelsPerSec && (
                         <TerminalLine label="pixels_per_second" value={formatNumber(pixelsPerSec)} accent />
                       )}

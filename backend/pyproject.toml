@@ -1,0 +1,22 @@
+[build-system]
+requires = ["scikit-build-core>=0.11,<0.12", "pybind11>=2.13,<3"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "high-performance-image-processor"
+version = "2.0.0"
+description = "OpenMP accelerated grayscale image filters"
+requires-python = ">=3.10"
+dependencies = ["fastapi==0.116.1", "numpy==2.2.6", "Pillow==11.3.0", "python-multipart==0.0.20", "uvicorn==0.35.0"]
+
+[project.optional-dependencies]
+opencv = ["opencv-python-headless==4.12.0.88"]
+test = ["httpx==0.28.1", "pytest==8.4.2", "pytest-cov==7.0.0"]
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+wheel.packages = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

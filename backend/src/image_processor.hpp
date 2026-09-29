@@ -20,4 +20,7 @@ void box_blur(pybind11::array_t<uint8_t>& image, int kernel_size);
 // @param image 2D uint8_t NumPy array (height x width), modified in-place
 void sobel_edge(pybind11::array_t<uint8_t>& image);
 
+bool openmp_enabled();
+int openmp_max_threads();
+
 } // namespace image_processor
