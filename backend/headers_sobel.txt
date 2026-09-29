@@ -1,7 +1,0 @@
-HTTP/1.1 200 OK
-date: Wed, 08 Jul 2026 16:07:03 GMT
-server: uvicorn
-x-processing-metrics: {'c_function_seconds': 0.000678899999911664, 'filter': 'sobel', 'kernel_size': 3}
-content-length: 465
-content-type: image/png
-
