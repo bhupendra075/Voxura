@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0",
+  "fixture_id": "replace-with-opaque-evaluation-id",
+  "source_name": "",
+  "source_url": "",
+  "license": "",
+  "license_reviewed_by": "",
+  "license_reviewed_at": "",
+  "deidentification_reviewed_by": "",
+  "retrieved_at": "",
+  "dataset_version": "",
+  "case_identifier": "",
+  "allowed_use": "controlled non-clinical evaluation only",
+  "clinical_data_root": false,
+  "files": [
+    {"relative_path": "", "sha256": "", "bytes": 0, "sop_class_uid": "", "transfer_syntax_uid": ""}
+  ],
+  "notes": []
+}

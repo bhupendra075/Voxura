@@ -8,3 +8,5 @@ pydicom==3.0.1
 PyJWT==2.10.1
 httpx==0.28.1
 psycopg[binary]==3.2.10
+alembic==1.16.5
+SQLAlchemy==2.0.43

@@ -7,6 +7,8 @@ This repository contains two deliberately separated applications:
 
 The clinical surface is a development-stage **radiologist-assist tool**. It is not an autonomous diagnosis system, certified diagnostic workstation, or substitute for a qualified clinician. No model is enabled merely because it is listed in the registry.
 
+The October 6 deliverable is a controlled, single-site evaluation pilot using licensed, de-identified data—not a clinical production release. Its intended use, supported DICOM matrix, stop conditions, risk register, fixture provenance template, and deployment/rollback runbooks are maintained in [`docs/controlled-pilot`](docs/controlled-pilot/INTENDED_USE.md). Run `python ops/scripts/verify_release.py` before producing any release candidate; incomplete gates default to NO-GO.
+
 ## Backend
 
 Use Python 3.10+ and, for the native image processor, a C++17 compiler with OpenMP.
@@ -28,19 +30,20 @@ cd backend
 
 ### Production clinical configuration
 
-Production startup fails unless the development session is disabled, a non-default JWT secret is provided, and PostgreSQL is configured.
+Production startup fails unless the development session is disabled, PostgreSQL is configured and migrated, and a trusted identity-proxy secret is provided. JWT sessions are development/test-only.
 
 ```text
 CLINICAL_ENV=production
 CLINICAL_DEV_MODE=0
-CLINICAL_JWT_SECRET=<secret-manager-value>
+CLINICAL_AUTH_MODE=proxy
+CLINICAL_TRUSTED_PROXY_SECRET=<at-least-32-byte-secret-manager-value>
 CLINICAL_DATABASE_URL=postgresql://...
 CLINICAL_DATA_ROOT=<encrypted-controlled-storage>
 PACS_DICOMWEB_URL=https://...
 PACS_BEARER_TOKEN=<secret-manager-value>
 ```
 
-Clinical records are institution-scoped from the authenticated token. Browser responses for source frames use `private, no-store`, source objects are content-hashed, and analysis artifacts remain separate from source DICOM.
+Run `alembic -c alembic.ini upgrade head` from `backend` before starting a production API. Clinical records are institution-scoped from the signed trusted-proxy identity. Browser responses for source frames use `private, no-store`, source objects are content-hashed, and analysis artifacts remain separate from source DICOM.
 
 The current AI worker reports `qualification-only`. It checks modality and available sequences, then explicitly abstains because no validated module is enabled. AutoRG-Brain and MONAI entries are research candidates; AI-Rad Companion Brain MR is a commercial candidate that may only be used within its licensed, jurisdiction-approved intended use.
 
@@ -79,6 +82,7 @@ npm test
 ```
 
 Set `VITE_API_BASE_URL` when the API is not served from `http://localhost:8000`.
+`VITE_CLINICAL_DEV_SESSION=true` is supplied only by `.env.development`; production builds must obtain an institution-issued session and never call `/v3/session/dev`.
 
 The AI Assist panel displays study qualification, detected sequences, model-registry state, explicit abstention, editable findings/impression drafts, optimistic draft versions, and a mandatory radiologist review checklist. “No model findings” is never presented as a normal study.
 

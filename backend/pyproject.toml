@@ -7,7 +7,7 @@ name = "high-performance-image-processor"
 version = "2.0.0"
 description = "OpenMP accelerated grayscale image filters"
 requires-python = ">=3.10"
-dependencies = ["fastapi==0.116.1", "numpy==2.2.6", "Pillow==11.3.0", "python-multipart==0.0.20", "uvicorn==0.35.0", "pydicom==3.0.1", "PyJWT==2.10.1", "httpx==0.28.1", "psycopg[binary]==3.2.10"]
+dependencies = ["fastapi==0.116.1", "numpy==2.2.6", "Pillow==11.3.0", "python-multipart==0.0.20", "uvicorn==0.35.0", "pydicom==3.0.1", "PyJWT==2.10.1", "httpx==0.28.1", "psycopg[binary]==3.2.10", "alembic==1.16.5", "SQLAlchemy==2.0.43"]
 
 [project.optional-dependencies]
 opencv = ["opencv-python-headless==4.12.0.88"]

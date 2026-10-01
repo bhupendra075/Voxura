@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0",
+  "release": {"version": "", "git_commit": "", "built_at": "", "artifact_sha256": [], "image_digests": []},
+  "environment": {"site": "single controlled evaluation site", "contains_phi": false, "supported_browser": "", "host_configuration": ""},
+  "gates": [
+    {"id": "scope", "status": "NOT_RUN", "evidence": [], "reviewer": ""},
+    {"id": "data-integrity", "status": "NOT_RUN", "evidence": [], "reviewer": ""},
+    {"id": "display", "status": "NOT_RUN", "evidence": [], "reviewer": ""},
+    {"id": "identity", "status": "NOT_RUN", "evidence": [], "reviewer": ""},
+    {"id": "security", "status": "NOT_RUN", "evidence": [], "reviewer": ""},
+    {"id": "reliability", "status": "NOT_RUN", "evidence": [], "reviewer": ""},
+    {"id": "traceability", "status": "NOT_RUN", "evidence": [], "reviewer": ""}
+  ],
+  "known_issues": [],
+  "automatic_no_go_conditions_observed": [],
+  "decision": "NO_GO",
+  "decision_by": "",
+  "decision_at": ""
+}

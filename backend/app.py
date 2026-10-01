@@ -6,12 +6,13 @@ import json
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
 import numpy as np
-from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi import FastAPI, File, Form, Request, UploadFile, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
@@ -215,16 +216,46 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT"],
-    allow_headers=["Authorization", "Content-Type"],
-    expose_headers=["Server-Timing", "X-Processor-Backend", "X-Image-Width", "X-Image-Height", "X-Processing-Mode", "X-Kernel-Size", "Deprecation", "Sunset"],
+    allow_headers=["Authorization", "Content-Type", "Range"],
+    expose_headers=["Server-Timing", "X-Processor-Backend", "X-Image-Width", "X-Image-Height", "X-Processing-Mode", "X-Kernel-Size", "Deprecation", "Sunset", "Accept-Ranges", "Content-Range", "X-Source-Immutable"],
 )
+
+
+@app.middleware("http")
+async def request_trace(request: Request, call_next):
+    """Attach a non-PHI correlation id to every response and error."""
+    request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    if request.url.path.startswith("/v3/instances/"):
+        # FileResponse generates range errors internally, so apply the clinical
+        # cache policy at the outer boundary for both success and error paths.
+        response.headers["Cache-Control"] = "private, no-store"
+    return response
+
 
 # The clinical v3 surface is isolated from the legacy image-filter API so the
 # source DICOM path never mutates or reuses processed demo pixels.
-from clinical import initialize_clinical_store, router as clinical_router
+from clinical import CLINICAL_ENV, clinical_readiness, initialize_clinical_store, verify_clinical_schema, router as clinical_router
 
-initialize_clinical_store()
+if CLINICAL_ENV == "production":
+    verify_clinical_schema()
+else:
+    initialize_clinical_store()
 app.include_router(clinical_router)
+
+
+@app.get("/health", include_in_schema=False)
+def health() -> dict[str, str]:
+    return {"status": "alive"}
+
+
+@app.get("/ready", include_in_schema=False)
+def ready() -> JSONResponse:
+    is_ready, checks = clinical_readiness()
+    return JSONResponse(status_code=200 if is_ready else 503,
+                        content={"status": "ready" if is_ready else "not_ready", "checks": checks})
 
 
 @app.exception_handler(ProcessorError)
@@ -239,6 +270,21 @@ async def validation_error_handler(_: Request, exc: RequestValidationError) -> J
         "code": "validation_error",
         "message": "Invalid request fields",
         "fields": fields,
+    }})
+
+
+@app.exception_handler(HTTPException)
+async def clinical_http_error_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    """Normalize clinical failures without exposing exception internals or PHI."""
+    detail = exc.detail
+    if isinstance(detail, dict):
+        code = str(detail.get("code", "request_failed"))
+        message = str(detail.get("message", "Request could not be completed"))
+    else:
+        code, message = "request_failed", str(detail)
+    return JSONResponse(status_code=exc.status_code, content={"error": {
+        "code": code, "message": message,
+        "request_id": getattr(request.state, "request_id", None),
     }})
 
 

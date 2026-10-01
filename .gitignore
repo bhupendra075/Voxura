@@ -1,4 +1,5 @@
 .venv/
+.venv-test/
 .vscode/
 __pycache__/
 *.py[cod]
@@ -16,6 +17,24 @@ backend/headers_*.txt
 backend/test_input.png
 backend/benchmark-report.json
 backend/clinical_data/
+backend/research_data/
+backend/evaluation_data/
+backend/model_cache/
+backend/migrations/__pycache__/
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+models/
+research-fixtures/
+evaluation-results/
+ops/.env
+ops/backups/
+release-evidence.json
+checkpoint*.yaml
+.tmp-smoke/
+.tmp-test/
+.test-tmp/
 
 frontend/node_modules/
 frontend/dist/

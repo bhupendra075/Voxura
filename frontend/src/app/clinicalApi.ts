@@ -8,14 +8,36 @@ export interface Study {
 export interface Series {
   id: string; modality: string; series_number: number | null; description: string; laterality: string;
   rows: number | null; columns: number | null; instance_count: number; frame_count: number;
+  has_geometry?: boolean; has_pixel_spacing?: boolean; warnings?: string[];
 }
-export interface Instance { id: string; instance_number: number | null; frame_count: number; transfer_syntax: string }
+export interface Instance {
+  id: string; instance_number: number | null; frame_count: number; transfer_syntax: string;
+  orientation?: number[] | null;
+}
+export interface ViewerManifestSeries extends Series {
+  ordering: "patient_geometry" | "instance_number_fallback";
+  complete: boolean;
+  measurement_calibrated: boolean;
+  instances: Array<Instance & {
+    sha256: string; geometry_position: number | null; orientation: number[] | null;
+    position: number[] | null; pixel_spacing: number[] | null;
+  }>;
+}
+export interface ViewerManifest {
+  study: Study; evaluation_only: boolean; source_pixels_immutable: boolean;
+  complete: boolean; warnings: string[]; series: ViewerManifestSeries[];
+}
 export interface SeriesMetadata { study: Study; series: Series; instances: Instance[] }
 export interface PresentationState {
+  version: number;
   layout: "1x1" | "1x2" | "2x2"; active_series_id: string | null; active_instance_id: string | null;
   frame: number; window_center: number | null; window_width: number | null; zoom: number;
   pan_x: number; pan_y: number; rotation: 0 | 90 | 180 | 270; inverted: boolean;
   annotations: Array<Record<string, unknown>>;
+}
+
+export class ClinicalApiError extends Error {
+  constructor(message: string, readonly status: number) { super(message); this.name = "ClinicalApiError"; }
 }
 export interface ModelCapability {
   id: string; display_name: string; version: string; status: string; intended_use: string;
@@ -47,9 +69,18 @@ export function isReviewChecklistComplete(checklist: ReviewChecklist): boolean {
 }
 
 const TOKEN_KEY = "clinical-viewer-token";
+const DEVELOPMENT_SESSION_ENABLED = import.meta.env.VITE_CLINICAL_DEV_SESSION === "true";
 
 export class ClinicalApi {
   token = typeof sessionStorage === "undefined" ? "" : sessionStorage.getItem(TOKEN_KEY) ?? "";
+
+  authorizationHeaders(): Record<string, string> {
+    return this.token ? { Authorization: `Bearer ${this.token}` } : {};
+  }
+
+  dicomUrl(instanceId: string): string {
+    return `${API_BASE_URL}/v3/instances/${encodeURIComponent(instanceId)}/dicom`;
+  }
 
   private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
     const headers = new Headers(init.headers);
@@ -61,7 +92,12 @@ export class ClinicalApi {
         const payload = await response.json() as { detail?: string | { message?: string }; error?: { message?: string } };
         message = typeof payload.detail === "string" ? payload.detail : payload.detail?.message ?? payload.error?.message ?? message;
       } catch { /* keep status message */ }
-      throw new Error(message);
+      if (response.status === 401 || response.status === 403) {
+        this.token = "";
+        if (typeof sessionStorage !== "undefined") sessionStorage.removeItem(TOKEN_KEY);
+        if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent("voxura:session-expired", { detail: { message } }));
+      }
+      throw new ClinicalApiError(message, response.status);
     }
     const contentType = response.headers.get("content-type") ?? "";
     return (contentType.includes("application/json") ? response.json() : response.blob()) as Promise<T>;
@@ -69,16 +105,23 @@ export class ClinicalApi {
 
   async ensureDevelopmentSession(): Promise<SessionUser> {
     if (!this.token) {
+      if (!DEVELOPMENT_SESSION_ENABLED) {
+        throw new Error("Sign in through the institution identity provider to access clinical studies");
+      }
       const session = await this.request<{ access_token: string; user: SessionUser }>("/v3/session/dev", { method: "POST" });
       this.token = session.access_token;
       if (typeof sessionStorage !== "undefined") sessionStorage.setItem(TOKEN_KEY, this.token);
       return session.user;
     }
-    return { id: "demo-radiologist", display_name: "Demo Radiologist", role: "radiologist" };
+    const session = await this.request<{ user?: Partial<SessionUser>; id?: string; display_name?: string; role?: string }>("/v3/session");
+    const user = session.user ?? session;
+    if (!user.id || !user.role) throw new Error("The authenticated session is missing required user identity fields");
+    return { id: user.id, role: user.role, display_name: user.display_name || user.id };
   }
 
   studies(query = "") { return this.request<{ items: Study[]; total: number }>(`/v3/studies${query ? `?patient=${encodeURIComponent(query)}` : ""}`); }
   series(studyId: string) { return this.request<{ items: Series[] }>(`/v3/studies/${studyId}/series`); }
+  viewerManifest(studyId: string) { return this.request<ViewerManifest>(`/v3/studies/${studyId}/viewer-manifest`); }
   metadata(studyId: string, seriesId: string) { return this.request<SeriesMetadata>(`/v3/studies/${studyId}/series/${seriesId}/metadata`); }
   report(studyId: string) { return this.request<{ status: string; text: string; updated_at: number | null }>(`/v3/studies/${studyId}/report`); }
   aiCapabilities() { return this.request<AiCapabilities>("/v3/ai/capabilities"); }

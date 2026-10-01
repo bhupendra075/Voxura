@@ -1,0 +1,14 @@
+{
+  "research_only": true,
+  "source": "RadGenome-Brain MRI",
+  "license_reviewed": false,
+  "case_id": "replace-with-upstream-held-out-case-id",
+  "split": "test",
+  "data_root": "D:/approved-research-data/radgenome",
+  "mode": "given-mask",
+  "artifacts": {
+    "image": { "path": "replace-with-image.nii.gz", "sha256": "replace-with-sha256" },
+    "anomaly_mask": { "path": "replace-with-mask.nii.gz", "sha256": "replace-with-sha256" },
+    "reference_report": { "path": "replace-with-report.json", "sha256": "replace-with-sha256" }
+  }
+}

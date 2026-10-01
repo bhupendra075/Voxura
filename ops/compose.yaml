@@ -1,0 +1,117 @@
+name: voxura-pilot
+
+services:
+  database:
+    image: postgres:16.4-alpine3.20
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - database-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    mem_limit: ${VOXURA_DATABASE_MEMORY_LIMIT:-2g}
+    cpus: ${VOXURA_DATABASE_CPUS:-2.0}
+    networks: [internal]
+
+  api:
+    build:
+      context: ..
+      dockerfile: ops/docker/backend.Dockerfile
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
+    environment:
+      CLINICAL_ENV: production
+      CLINICAL_DEV_MODE: "0"
+      CLINICAL_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@database:5432/${POSTGRES_DB}
+      CLINICAL_AUTH_MODE: proxy
+      CLINICAL_TRUSTED_PROXY_SECRET: ${CLINICAL_TRUSTED_PROXY_SECRET:?set CLINICAL_TRUSTED_PROXY_SECRET}
+      CLINICAL_TRUSTED_PROXY_MAX_AGE_SECONDS: ${CLINICAL_TRUSTED_PROXY_MAX_AGE_SECONDS:-60}
+      CLINICAL_DATA_ROOT: /var/lib/voxura/objects
+      CLINICAL_MAX_DICOM_BYTES: ${CLINICAL_MAX_DICOM_BYTES:-536870912}
+      CLINICAL_MAX_IMPORT_FILES: ${CLINICAL_MAX_IMPORT_FILES:-2000}
+      CLINICAL_MAX_IMPORT_BYTES: ${CLINICAL_MAX_IMPORT_BYTES:-2147483648}
+      PROCESSOR_REQUIRE_NATIVE: "0"
+    volumes:
+      - clinical-objects:/var/lib/voxura/objects
+    depends_on:
+      database:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    mem_limit: ${VOXURA_API_MEMORY_LIMIT:-3g}
+    cpus: ${VOXURA_API_CPUS:-2.0}
+    networks: [internal]
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: ops/docker/backend.Dockerfile
+    restart: "no"
+    read_only: true
+    tmpfs: [/tmp]
+    command: ["alembic", "-c", "alembic.ini", "upgrade", "head"]
+    environment:
+      CLINICAL_ENV: production
+      CLINICAL_DEV_MODE: "0"
+      CLINICAL_AUTH_MODE: proxy
+      CLINICAL_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@database:5432/${POSTGRES_DB}
+      CLINICAL_TRUSTED_PROXY_SECRET: ${CLINICAL_TRUSTED_PROXY_SECRET:?set CLINICAL_TRUSTED_PROXY_SECRET}
+      CLINICAL_TRUSTED_PROXY_MAX_AGE_SECONDS: ${CLINICAL_TRUSTED_PROXY_MAX_AGE_SECONDS:-60}
+      CLINICAL_DATA_ROOT: /var/lib/voxura/objects
+    volumes:
+      - clinical-objects:/var/lib/voxura/objects
+    depends_on:
+      database:
+        condition: service_healthy
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: ${VOXURA_MIGRATION_MEMORY_LIMIT:-1g}
+    cpus: ${VOXURA_MIGRATION_CPUS:-1.0}
+    networks: [internal]
+
+  web:
+    build:
+      context: ..
+      dockerfile: ops/docker/frontend.Dockerfile
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/var/cache/nginx, /var/run]
+    ports:
+      - "${VOXURA_BIND_ADDRESS:-127.0.0.1}:${VOXURA_PORT:-8080}:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:8080/"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: ${VOXURA_WEB_MEMORY_LIMIT:-256m}
+    cpus: ${VOXURA_WEB_CPUS:-1.0}
+    networks: [internal]
+
+networks:
+  internal:
+    internal: true
+
+volumes:
+  database-data:
+  clinical-objects:
