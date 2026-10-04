@@ -1,13 +1,13 @@
-# MedScope Viewer and High-Performance Image Processor
+# Voxura
 
-This repository contains two deliberately separated applications:
+This repository contains two separate applications:
 
 - A versioned `/v2` CPU/OpenMP image-processing API for grayscale box blur and Sobel processing.
-- A `/v3` clinical-viewer foundation for immutable DICOM ingestion, institution-scoped worklists, reversible presentation state, and evidence-grounded brain-MRI assistance.
+- A `/v3` DICOM evaluation viewer for immutable ingestion, institution-scoped worklists, reversible presentation state, proposed reviewer records, and reviewable draft notes.
 
-The clinical surface is a development-stage **radiologist-assist tool**. It is not an autonomous diagnosis system, certified diagnostic workstation, or substitute for a qualified clinician. No model is enabled merely because it is listed in the registry.
+The viewer is a development-stage **radiologist-assist tool**. It is not an autonomous diagnosis system, certified diagnostic workstation, or substitute for a qualified clinician. The current AI worker is `qualification-only` and abstains; no model is enabled for clinical findings.
 
-The October 6 deliverable is a controlled, single-site evaluation pilot using licensed, de-identified data—not a clinical production release. Its intended use, supported DICOM matrix, stop conditions, risk register, fixture provenance template, and deployment/rollback runbooks are maintained in [`docs/controlled-pilot`](docs/controlled-pilot/INTENDED_USE.md). Run `python ops/scripts/verify_release.py` before producing any release candidate; incomplete gates default to NO-GO.
+**Release status: NO-GO.** The October 6 target is a controlled, single-site evaluation using licensed, de-identified data, not a clinical production release. All seven formal gates remain `NOT_RUN`. Approved reference data and tolerances, confirmed site reviewers, institutional identity, and an isolated operational rehearsal are still required. See the [release gates](docs/controlled-pilot/RELEASE_GATES.md), [supported DICOM matrix](docs/controlled-pilot/SUPPORTED_DICOM.md), and [project plan](docs/PROJECT_PLAN.md).
 
 ## Backend
 
@@ -28,6 +28,10 @@ cd backend
 .\.venv\Scripts\python -m pytest
 ```
 
+From the repository root, run `python ops/scripts/verify_release.py` for static release controls. It also checks the ignored `ops/.env` when present and fails on placeholder secrets. The [engineering CI workflow](.github/workflows/engineering.yml) repeats backend, native processor, frontend, and static checks; it has not yet run on a hosted runner.
+
+The October 4 local run had **51 backend tests passed, 1 native-extension skip, and 1 dependency warning**; **19 frontend tests, typecheck, lint, and build passed**. Local release preflight failed because `ops/.env` has a placeholder or unset `POSTGRES_PASSWORD`. These engineering checks do not establish pilot acceptance.
+
 ### Production clinical configuration
 
 Production startup fails unless the development session is disabled, PostgreSQL is configured and migrated, and a trusted identity-proxy secret is provided. JWT sessions are development/test-only.
@@ -43,7 +47,7 @@ PACS_DICOMWEB_URL=https://...
 PACS_BEARER_TOKEN=<secret-manager-value>
 ```
 
-Run `alembic -c alembic.ini upgrade head` from `backend` before starting a production API. Clinical records are institution-scoped from the signed trusted-proxy identity. Browser responses for source frames use `private, no-store`, source objects are content-hashed, and analysis artifacts remain separate from source DICOM.
+Production requires PostgreSQL at Alembic revision `20261004_002`, a disabled development session, and a trusted signed identity proxy. Apply production migrations only through the approved [deployment runbook](docs/controlled-pilot/DEPLOYMENT.md). The bundled Nginx clears browser identity headers and does not provide institutional login or signing; unmodified Compose cannot grant clinical access. Clinical records are institution-scoped, source objects are content-hashed, and analysis artifacts remain separate from source DICOM.
 
 The current AI worker reports `qualification-only`. It checks modality and available sequences, then explicitly abstains because no validated module is enabled. AutoRG-Brain and MONAI entries are research candidates; AI-Rad Companion Brain MR is a commercial candidate that may only be used within its licensed, jurisdiction-approved intended use.
 
@@ -79,6 +83,7 @@ npm run dev
 npm run typecheck
 npm run lint
 npm test
+npm run build
 ```
 
 Set `VITE_API_BASE_URL` when the API is not served from `http://localhost:8000`.
@@ -86,37 +91,11 @@ Set `VITE_API_BASE_URL` when the API is not served from `http://localhost:8000`.
 
 The AI Assist panel displays study qualification, detected sequences, model-registry state, explicit abstention, editable findings/impression drafts, optimistic draft versions, and a mandatory radiologist review checklist. “No model findings” is never presented as a normal study.
 
-### Supabase Postgres
+Institution administrators can add proposed reviewers in the client. These records are institution-scoped nominations, not confirmed appointments or formal signoff.
 
-The clinical schema can run on the Supabase Postgres database for project
-`xyzjnlkufyzzgcnkcjsh`. The application connects to Supabase through its
-PostgreSQL endpoint; no Supabase client key is needed by the backend, and
-credentials must not be committed to the repository.
+### Optional Supabase Postgres
 
-In the Supabase dashboard, open **Connect**, choose the **Transaction pooler**
-connection for serverless/container deployments (or the direct connection for
-a long-lived private server), and set the resulting URI as
-`SUPABASE_DATABASE_URL`. Include `sslmode=require` in the URI. For example:
-
-```text
-SUPABASE_DATABASE_URL=postgresql://postgres.<project-ref>:<password>@<pooler-host>:6543/postgres?sslmode=require
-```
-
-`CLINICAL_DATABASE_URL` takes precedence when both variables are present, so
-existing deployments remain compatible. For a local backend, export
-`SUPABASE_DATABASE_URL`, then run the migration before starting the API:
-
-```powershell
-cd backend
-$env:SUPABASE_DATABASE_URL = "postgresql://..."
-.\.venv\Scripts\python -m alembic -c alembic.ini upgrade head
-.\.venv\Scripts\python -m uvicorn app:app --host 127.0.0.1 --port 8000
-```
-
-When using `ops/compose.yaml`, put the same value in the ignored
-`ops/.env` file as `CLINICAL_DATABASE_URL=...`; this overrides the bundled
-local Postgres service while preserving the existing local-development
-fallback.
+The backend can use a Supabase PostgreSQL endpoint through `SUPABASE_DATABASE_URL`; `CLINICAL_DATABASE_URL` takes precedence. Keep credentials in an ignored environment file or approved secret manager. No Supabase client key is needed in the browser for this backend connection. The same migration, identity, and pilot approval gates apply as for any other PostgreSQL deployment.
 
 ## Image-processing API
 
