@@ -68,6 +68,33 @@ def test_proxy_mode_rejects_stale_and_tampered_scoped_identity(monkeypatch):
     assert response.json()["error"]["code"] == "untrusted_proxy_identity"
 
 
+def test_proxy_mode_has_no_bearer_fallback_or_unsigned_identity_changes(monkeypatch):
+    monkeypatch.setattr(clinical, "AUTH_MODE", "proxy")
+    monkeypatch.setattr(clinical, "TRUSTED_PROXY_SECRET", "test-proxy-secret-that-is-long-enough")
+
+    bearer_only = client.get("/v3/session", headers={"Authorization": "Bearer development-token"})
+    assert bearer_only.status_code == 401
+    assert bearer_only.json()["error"]["code"] == "trusted_identity_required"
+
+    malformed = _proxy_headers()
+    malformed["X-Voxura-Timestamp"] = "not-a-timestamp"
+    response = client.get("/v3/session", headers=malformed)
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "invalid_proxy_identity"
+
+    future = _proxy_headers(timestamp=str(int(time.time()) + clinical.TRUSTED_PROXY_MAX_AGE_SECONDS + 1))
+    response = client.get("/v3/session", headers=future)
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "stale_proxy_identity"
+
+    for header, value in (("X-Voxura-User", "reader-2"), ("X-Voxura-Role", "administrator")):
+        tampered = _proxy_headers()
+        tampered[header] = value
+        response = client.get("/v3/session", headers=tampered)
+        assert response.status_code == 401
+        assert response.json()["error"]["code"] == "untrusted_proxy_identity"
+
+
 def test_clinician_role_cannot_import(monkeypatch):
     monkeypatch.setattr(clinical, "AUTH_MODE", "proxy")
     monkeypatch.setattr(clinical, "TRUSTED_PROXY_SECRET", "test-proxy-secret-that-is-long-enough")

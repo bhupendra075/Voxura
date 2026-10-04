@@ -38,6 +38,17 @@ export function buildDicomImageIds(instances: Instance[], dicomUrl: (id: string)
   return instances.map((instance) => `wadouri:${dicomUrl(instance.id)}`);
 }
 
+export function resolveVoiRange(
+  presentation: { window_center: number | null; window_width: number | null },
+  instance: Pick<Instance, "window_center" | "window_width"> | undefined,
+) {
+  const center = presentation.window_center ?? instance?.window_center;
+  const width = presentation.window_width ?? instance?.window_width;
+  if (typeof center !== "number" || !Number.isFinite(center)
+      || typeof width !== "number" || !Number.isFinite(width) || width <= 0) return undefined;
+  return { lower: center - width / 2, upper: center + width / 2 };
+}
+
 export function dicomLoaderHeaders(defaultHeaders: Record<string, string>, authorizationHeaders: Record<string, string>) {
   return { ...defaultHeaders, ...authorizationHeaders };
 }

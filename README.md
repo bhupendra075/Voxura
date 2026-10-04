@@ -86,6 +86,38 @@ Set `VITE_API_BASE_URL` when the API is not served from `http://localhost:8000`.
 
 The AI Assist panel displays study qualification, detected sequences, model-registry state, explicit abstention, editable findings/impression drafts, optimistic draft versions, and a mandatory radiologist review checklist. “No model findings” is never presented as a normal study.
 
+### Supabase Postgres
+
+The clinical schema can run on the Supabase Postgres database for project
+`xyzjnlkufyzzgcnkcjsh`. The application connects to Supabase through its
+PostgreSQL endpoint; no Supabase client key is needed by the backend, and
+credentials must not be committed to the repository.
+
+In the Supabase dashboard, open **Connect**, choose the **Transaction pooler**
+connection for serverless/container deployments (or the direct connection for
+a long-lived private server), and set the resulting URI as
+`SUPABASE_DATABASE_URL`. Include `sslmode=require` in the URI. For example:
+
+```text
+SUPABASE_DATABASE_URL=postgresql://postgres.<project-ref>:<password>@<pooler-host>:6543/postgres?sslmode=require
+```
+
+`CLINICAL_DATABASE_URL` takes precedence when both variables are present, so
+existing deployments remain compatible. For a local backend, export
+`SUPABASE_DATABASE_URL`, then run the migration before starting the API:
+
+```powershell
+cd backend
+$env:SUPABASE_DATABASE_URL = "postgresql://..."
+.\.venv\Scripts\python -m alembic -c alembic.ini upgrade head
+.\.venv\Scripts\python -m uvicorn app:app --host 127.0.0.1 --port 8000
+```
+
+When using `ops/compose.yaml`, put the same value in the ignored
+`ops/.env` file as `CLINICAL_DATABASE_URL=...`; this overrides the bundled
+local Postgres service while preserving the existing local-development
+fallback.
+
 ## Image-processing API
 
 The preferred `/v2` backend is the pybind11/OpenMP extension; OpenCV and NumPy are development fallbacks. Set `PROCESSOR_REQUIRE_NATIVE=1` in production to fail instead of silently falling back.

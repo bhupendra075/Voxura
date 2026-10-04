@@ -1,6 +1,8 @@
 import { API_BASE_URL } from "./api";
 
 export interface SessionUser { id: string; display_name: string; role: string }
+export interface Reviewer { id: string; name: string; affiliation: string; expertise: string; source_url: string; status: "proposed"; created_at: number }
+export type ReviewerInput = Pick<Reviewer, "name" | "affiliation" | "expertise" | "source_url">;
 export interface Study {
   id: string; patient_name: string; patient_id: string; birth_date: string; sex: string;
   accession: string; study_date: string; description: string; modalities: string; status: string;
@@ -12,7 +14,7 @@ export interface Series {
 }
 export interface Instance {
   id: string; instance_number: number | null; frame_count: number; transfer_syntax: string;
-  orientation?: number[] | null;
+  orientation?: number[] | null; window_center?: number | null; window_width?: number | null;
 }
 export interface ViewerManifestSeries extends Series {
   ordering: "patient_geometry" | "instance_number_fallback";
@@ -120,6 +122,8 @@ export class ClinicalApi {
   }
 
   studies(query = "") { return this.request<{ items: Study[]; total: number }>(`/v3/studies${query ? `?patient=${encodeURIComponent(query)}` : ""}`); }
+  reviewers() { return this.request<{ items: Reviewer[] }>("/v3/reviewers"); }
+  addReviewer(input: ReviewerInput) { return this.request<Reviewer>("/v3/reviewers", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) }); }
   series(studyId: string) { return this.request<{ items: Series[] }>(`/v3/studies/${studyId}/series`); }
   viewerManifest(studyId: string) { return this.request<ViewerManifest>(`/v3/studies/${studyId}/viewer-manifest`); }
   metadata(studyId: string, seriesId: string) { return this.request<SeriesMetadata>(`/v3/studies/${studyId}/series/${seriesId}/metadata`); }

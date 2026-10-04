@@ -1,12 +1,20 @@
 import { describe, expect, it } from "vitest";
 import type { Instance } from "./clinicalApi";
-import { buildDicomImageIds, dicomLoaderHeaders, isLengthMeasurementAvailable, orientationLabels, partitionSupportedInstances, viewerBlockingReason, viewerErrorMessage } from "./viewerPolicy";
+import { buildDicomImageIds, dicomLoaderHeaders, isLengthMeasurementAvailable, orientationLabels, partitionSupportedInstances, resolveVoiRange, viewerBlockingReason, viewerErrorMessage } from "./viewerPolicy";
 
 const instance = (id: string, transfer_syntax = "1.2.840.10008.1.2.1", frame_count = 1): Instance => ({
   id, transfer_syntax, frame_count, instance_number: 1,
 });
 
 describe("controlled-pilot viewer policy", () => {
+  it("uses saved VOI first and falls back to the source-instance VOI", () => {
+    expect(resolveVoiRange({ window_center: null, window_width: null }, { window_center: 332, window_width: 715 }))
+      .toEqual({ lower: -25.5, upper: 689.5 });
+    expect(resolveVoiRange({ window_center: 40, window_width: 400 }, { window_center: 332, window_width: 715 }))
+      .toEqual({ lower: -160, upper: 240 });
+    expect(resolveVoiRange({ window_center: null, window_width: null }, { window_center: 10, window_width: 0 }))
+      .toBeUndefined();
+  });
   it("builds wadouri image IDs without changing manifest order", () => {
     expect(buildDicomImageIds([instance("one"), instance("id/with spaces")], (id) => `/v3/instances/${encodeURIComponent(id)}/dicom`)).toEqual([
       "wadouri:/v3/instances/one/dicom",

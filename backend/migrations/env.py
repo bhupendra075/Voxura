@@ -10,7 +10,7 @@ config = context.config
 if config.config_file_name:
     fileConfig(config.config_file_name)
 
-database_url = os.environ.get("CLINICAL_DATABASE_URL")
+database_url = os.environ.get("CLINICAL_DATABASE_URL") or os.environ.get("SUPABASE_DATABASE_URL")
 if not database_url:
     raise RuntimeError("CLINICAL_DATABASE_URL is required for migrations")
 

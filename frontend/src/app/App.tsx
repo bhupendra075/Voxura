@@ -6,6 +6,7 @@ import {
 } from "lucide-react";
 import { ClinicalApiError, clinicalApi, isReviewChecklistComplete, type AiCapabilities, type AnalysisResults, type Instance, type PresentationState, type ReportDraft, type Series, type Study, type ViewerManifest } from "./clinicalApi";
 import { ClinicalViewport, type ViewerTool, type ViewportControls } from "./ClinicalViewport";
+import { ReviewerDirectory } from "./ReviewerDirectory";
 import { isLengthMeasurementAvailable, partitionSupportedInstances, viewerBlockingReason } from "./viewerPolicy";
 
 const defaultState: PresentationState = {
@@ -36,6 +37,8 @@ function EmptyViewer() {
 export default function App() {
   const [ready, setReady] = useState(false);
   const [user, setUser] = useState("Radiologist");
+  const [userRole, setUserRole] = useState("");
+  const [showReviewers, setShowReviewers] = useState(false);
   const [pacs, setPacs] = useState({ configured: false, reachable: false, message: "Checking PACS…" });
   const [studies, setStudies] = useState<Study[]>([]);
   const [query, setQuery] = useState("");
@@ -79,6 +82,7 @@ export default function App() {
       try {
         const session = await clinicalApi.ensureDevelopmentSession();
         setUser(session.display_name);
+        setUserRole(session.role);
         const [health, ai] = await Promise.all([clinicalApi.pacsHealth(), clinicalApi.aiCapabilities(), refreshStudies("")]);
         setPacs(health);
         setCapabilities(ai);
@@ -95,7 +99,7 @@ export default function App() {
       viewportControls.current = null;
       setSelectedStudy(null); setSelectedSeries(null); setSeries([]); setViewerManifest(null);
       setInstances([]); setInstanceIndex(0); setFrame(0); setCine(false); setViewerBlocker(null);
-      setShowWorklist(true); setError(message || "Your session expired. Sign in again before viewing clinical data.");
+      setShowWorklist(true); setShowReviewers(false); setUserRole(""); setError(message || "Your session expired. Sign in again before viewing clinical data.");
     };
     window.addEventListener("voxura:session-expired", handleSessionExpired);
     return () => window.removeEventListener("voxura:session-expired", handleSessionExpired);
@@ -256,7 +260,8 @@ export default function App() {
       <div className="flex items-center gap-3"><div className="rounded bg-cyan-500/15 p-1.5 text-cyan-300"><Crosshair size={20} /></div><div><h1 className="text-sm font-bold tracking-wide">Voxura</h1><p className="text-[10px] uppercase tracking-[.16em] text-slate-500">Clinical visualization aid · Not autonomous diagnosis</p></div></div>
       <div className="ml-auto flex items-center gap-3">
         <div className={`flex items-center gap-2 rounded border px-2.5 py-1 text-xs ${pacs.reachable ? "border-emerald-800 bg-emerald-950/50 text-emerald-300" : "border-amber-900 bg-amber-950/40 text-amber-300"}`}><span className={`h-1.5 w-1.5 rounded-full ${pacs.reachable ? "bg-emerald-400" : "bg-amber-400"}`} />{pacs.message}</div>
-        <div className="flex items-center gap-2 text-xs text-slate-300"><CircleUserRound size={17} /><span>{user}</span><Badge>Radiologist</Badge></div>
+        {userRole === "administrator" && <button onClick={() => { setShowReviewers(true); setShowWorklist(true); }} className="rounded border border-slate-600 px-3 py-1.5 text-xs hover:bg-slate-800">Reviewers</button>}
+        <div className="flex items-center gap-2 text-xs text-slate-300"><CircleUserRound size={17} /><span>{user}</span><Badge>{userRole || "Session"}</Badge></div>
       </div>
     </header>
 
@@ -274,7 +279,7 @@ export default function App() {
     {error && <div role="alert" className="flex shrink-0 items-center gap-2 border-b border-red-900 bg-red-950/80 px-4 py-2 text-xs text-red-200"><AlertTriangle size={15} /><span className="flex-1">{error}</span><button onClick={() => setError(null)} className="underline">Dismiss</button></div>}
 
     <main className="min-h-0 flex-1">
-      {showWorklist || !selectedStudy ? <section className="h-full overflow-auto bg-slate-100 text-slate-950">
+      {showReviewers && userRole === "administrator" ? <ReviewerDirectory onClose={() => setShowReviewers(false)} /> : showWorklist || !selectedStudy ? <section className="h-full overflow-auto bg-slate-100 text-slate-950">
         <div className="mx-auto max-w-7xl p-6">
           <div className="mb-6 flex items-end justify-between"><div><h2 className="text-2xl font-semibold">Imaging worklist</h2><p className="mt-1 text-sm text-slate-600">Search local studies or connect an institutional DICOMweb archive.</p></div><div className="flex gap-2"><input ref={fileInput} type="file" accept=".dcm,application/dicom" multiple className="hidden" onChange={(event) => void handleImport(Array.from(event.target.files ?? []))} /><button onClick={() => fileInput.current?.click()} className="flex items-center gap-2 rounded bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700"><Upload size={16} /> Import DICOM</button></div></div>
           <div className="mb-2 flex items-center justify-between text-xs text-slate-500"><span>Search only within your institution.</span><span>{studies.length} study{studies.length === 1 ? "" : "ies"} shown</span></div>

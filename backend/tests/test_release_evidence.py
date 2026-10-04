@@ -75,10 +75,36 @@ def test_deployment_assets_fail_closed_and_backup_binary_data_safely():
 
 def test_production_schema_check_requires_alembic_revision():
     clinical = (ROOT / "backend" / "clinical.py").read_text(encoding="utf-8")
-    migration = (ROOT / "backend" / "migrations" / "versions" / "20260930_001_clinical_baseline.py").read_text(encoding="utf-8")
-    assert 'EXPECTED_ALEMBIC_REVISION = "20260930_001"' in clinical
+    baseline = (ROOT / "backend" / "migrations" / "versions" / "20260930_001_clinical_baseline.py").read_text(encoding="utf-8")
+    reviewer = (ROOT / "backend" / "migrations" / "versions" / "20261004_002_reviewer_directory.py").read_text(encoding="utf-8")
+    assert 'EXPECTED_ALEMBIC_REVISION = "20261004_002"' in clinical
     assert "SELECT version_num FROM alembic_version" in clinical
-    assert 'revision = "20260930_001"' in migration
+    assert 'revision = "20260930_001"' in baseline
+    assert 'revision = "20261004_002"' in reviewer
+    assert 'down_revision = "20260930_001"' in reviewer
+
+
+def test_reviewer_migration_uses_alembic_connection():
+    import importlib.util
+
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from sqlalchemy import create_engine, inspect
+
+    path = ROOT / "backend" / "migrations" / "versions" / "20261004_002_reviewer_directory.py"
+    spec = importlib.util.spec_from_file_location("reviewer_directory_migration", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    with engine.begin() as connection:
+        with Operations.context(MigrationContext.configure(connection)):
+            module.upgrade()
+        columns = {column["name"] for column in inspect(connection).get_columns("reviewers")}
+        indexes = {index["name"] for index in inspect(connection).get_indexes("reviewers")}
+    assert {"id", "institution", "status", "added_by"} <= columns
+    assert "reviewers_institution_idx" in indexes
 
 
 def test_irreversible_baseline_has_restore_only_rollback_runbook():

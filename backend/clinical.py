@@ -31,7 +31,7 @@ from PIL import Image
 DATA_ROOT = Path(os.getenv("CLINICAL_DATA_ROOT", Path(__file__).with_name("clinical_data")))
 DB_PATH = DATA_ROOT / "clinical.db"
 OBJECT_ROOT = DATA_ROOT / "objects"
-DATABASE_URL = os.getenv("CLINICAL_DATABASE_URL", f"sqlite:///{DB_PATH.as_posix()}")
+DATABASE_URL = os.getenv("CLINICAL_DATABASE_URL") or os.getenv("SUPABASE_DATABASE_URL") or f"sqlite:///{DB_PATH.as_posix()}"
 CLINICAL_ENV = os.getenv("CLINICAL_ENV", "development").lower()
 JWT_SECRET = os.getenv("CLINICAL_JWT_SECRET", "development-only-change-me")
 DEV_MODE = os.getenv("CLINICAL_DEV_MODE", "1" if CLINICAL_ENV == "development" else "0").lower() in {"1", "true", "yes"}
@@ -45,7 +45,7 @@ TRUSTED_PROXY_SECRET = os.getenv("CLINICAL_TRUSTED_PROXY_SECRET", "")
 AUTH_MODE = os.getenv("CLINICAL_AUTH_MODE", "proxy" if CLINICAL_ENV == "production" else "jwt").lower()
 TRUSTED_PROXY_MAX_AGE_SECONDS = int(os.getenv("CLINICAL_TRUSTED_PROXY_MAX_AGE_SECONDS", "60"))
 QUALIFICATION_VERSION = "2026-09-29-stir-v1"
-EXPECTED_ALEMBIC_REVISION = "20260930_001"
+EXPECTED_ALEMBIC_REVISION = "20261004_002"
 SUPPORTED_MODALITIES = {"CR", "DX", "CT", "MR"}
 SUPPORTED_SOP_CLASSES = {
     str(ComputedRadiographyImageStorage), str(DigitalXRayImageStorageForPresentation),
@@ -149,11 +149,12 @@ def initialize_clinical_store() -> None:
         CREATE TABLE IF NOT EXISTS presentation_states (
             study_id TEXT NOT NULL, user_id TEXT NOT NULL, institution TEXT NOT NULL,
             state_json TEXT NOT NULL,
-            updated_at DOUBLE PRECISION NOT NULL, PRIMARY KEY(study_id,user_id)
+            updated_at DOUBLE PRECISION NOT NULL, PRIMARY KEY(study_id,user_id,institution)
         );
         CREATE TABLE IF NOT EXISTS reports (
-            study_id TEXT PRIMARY KEY, status TEXT NOT NULL, text TEXT NOT NULL,
-            updated_at DOUBLE PRECISION NOT NULL
+            study_id TEXT NOT NULL, institution TEXT NOT NULL, status TEXT NOT NULL,
+            text TEXT NOT NULL, updated_at DOUBLE PRECISION NOT NULL,
+            PRIMARY KEY(study_id,institution)
         );
         CREATE TABLE IF NOT EXISTS model_registry (
             id TEXT PRIMARY KEY, display_name TEXT NOT NULL, version TEXT NOT NULL,
@@ -185,6 +186,12 @@ def initialize_clinical_store() -> None:
             version INTEGER NOT NULL, state_json TEXT NOT NULL, changed_by TEXT NOT NULL,
             changed_at DOUBLE PRECISION NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS reviewers (
+            id TEXT PRIMARY KEY, institution TEXT NOT NULL, name TEXT NOT NULL,
+            affiliation TEXT NOT NULL, expertise TEXT NOT NULL, source_url TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'proposed', added_by TEXT NOT NULL,
+            created_at DOUBLE PRECISION NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS audit_events (
             id {audit_id}, timestamp DOUBLE PRECISION NOT NULL, institution TEXT NOT NULL,
             user_id TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL,
@@ -201,6 +208,9 @@ def initialize_clinical_store() -> None:
         _add_column_if_missing(connection, "instances", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
         _add_column_if_missing(connection, "presentation_states", "version", "INTEGER NOT NULL DEFAULT 0")
         _add_column_if_missing(connection, "presentation_states", "institution", "TEXT NOT NULL DEFAULT 'DEMO'")
+        _add_column_if_missing(connection, "reports", "institution", "TEXT NOT NULL DEFAULT 'DEMO'")
+        connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS presentation_state_tenant_key ON presentation_states(study_id,user_id,institution)")
+        connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS report_tenant_key ON reports(study_id,institution)")
         if not connection.postgres:
             # The application never updates or deletes audit events. These guards make
             # accidental local mutation visible during development and tests.
@@ -321,6 +331,13 @@ class ReviewChecklist(BaseModel):
     priors_checked: bool
     critical_findings_checked: bool
     warnings_resolved: bool
+
+
+class ReviewerCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=160)
+    affiliation: str = Field(min_length=2, max_length=200)
+    expertise: str = Field(min_length=2, max_length=200)
+    source_url: str = Field(default="", max_length=500)
 
 
 def _proxy_signature(user_id: str, role: str, institution: str, timestamp: str) -> str:
@@ -910,8 +927,8 @@ def put_presentation_state(study_id: str, state: PresentationState, principal: A
         saved = state.model_copy(update={"version": current_version + 1})
         connection.execute(
             "INSERT INTO presentation_states(study_id,user_id,institution,state_json,updated_at,version) "
-            "VALUES(?,?,?,?,?,?) ON CONFLICT(study_id,user_id) DO UPDATE SET "
-            "institution=excluded.institution,state_json=excluded.state_json,"
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(study_id,user_id,institution) DO UPDATE SET "
+            "state_json=excluded.state_json,"
             "updated_at=excluded.updated_at,version=excluded.version",
             (study_id, principal.user_id, principal.institution, saved.model_dump_json(), time.time(), saved.version),
         )
@@ -923,7 +940,10 @@ def put_presentation_state(study_id: str, state: PresentationState, principal: A
 def study_report(study_id: str, principal: Annotated[Principal, Depends(_principal)]) -> dict[str, Any]:
     with _db() as connection:
         _require_study(connection, study_id, principal)
-        row = connection.execute("SELECT status,text,updated_at FROM reports WHERE study_id=?", (study_id,)).fetchone()
+        row = connection.execute(
+            "SELECT status,text,updated_at FROM reports WHERE study_id=? AND institution=?",
+            (study_id, principal.institution),
+        ).fetchone()
     return dict(row) if row else {"status": "unavailable", "text": "No signed report is available for this study.", "updated_at": None}
 
 
@@ -1106,3 +1126,33 @@ def recent_audit(principal: Annotated[Principal, Depends(_principal)], limit: in
     with _db() as connection:
         rows = connection.execute("SELECT timestamp,user_id,role,action,resource_type,resource_id,outcome FROM audit_events WHERE institution=? ORDER BY id DESC LIMIT ?", (principal.institution, limit)).fetchall()
     return {"items": [dict(row) for row in rows]}
+
+
+@router.get("/reviewers")
+def list_reviewers(principal: Annotated[Principal, Depends(_principal)]) -> dict[str, Any]:
+    if principal.role != "administrator":
+        raise HTTPException(403, detail={"code": "administrator_required", "message": "Administrator role required"})
+    with _db() as connection:
+        rows = connection.execute(
+            "SELECT id,name,affiliation,expertise,source_url,status,created_at "
+            "FROM reviewers WHERE institution=? ORDER BY created_at DESC,id DESC",
+            (principal.institution,),
+        ).fetchall()
+    return {"items": [dict(row) for row in rows]}
+
+
+@router.post("/reviewers", status_code=201)
+def add_reviewer(entry: ReviewerCreate, principal: Annotated[Principal, Depends(_principal)]) -> dict[str, Any]:
+    if principal.role != "administrator":
+        raise HTTPException(403, detail={"code": "administrator_required", "message": "Administrator role required"})
+    reviewer_id = str(uuid.uuid4())
+    created_at = time.time()
+    with _db() as connection:
+        connection.execute(
+            "INSERT INTO reviewers(id,institution,name,affiliation,expertise,source_url,status,added_by,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (reviewer_id, principal.institution, entry.name.strip(), entry.affiliation.strip(),
+             entry.expertise.strip(), entry.source_url.strip(), "proposed", principal.user_id, created_at),
+        )
+    _audit(principal, "reviewer.propose", "reviewer", reviewer_id)
+    return {"id": reviewer_id, **entry.model_dump(), "status": "proposed", "created_at": created_at}

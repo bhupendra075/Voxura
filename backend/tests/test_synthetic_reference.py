@@ -43,7 +43,17 @@ def test_synthetic_reference_import_preserves_sources_and_geometry(tmp_path):
     assert series["ordering"] == "patient_geometry"
     assert series["measurement_calibrated"] is True
     assert [item["geometry_position"] for item in series["instances"]] == [-2, 0, 2]
-    for item in series["instances"]:
+    assert series["instance_count"] == len(manifest["files"])
+    for expected, item in zip(manifest["files"], series["instances"], strict=True):
+        assert item["sha256"] == expected["sha256"]
+        assert [float(value) for value in item["orientation"]] == manifest["orientation_patient"]
+        assert [float(value) for value in item["pixel_spacing"]] == manifest["pixel_spacing_mm"]
+        assert float(item["window_center"]) == manifest["window_center"]
+        assert float(item["window_width"]) == manifest["window_width"]
         stored = client.get(item["dicom_url"], headers=auth)
         assert stored.status_code == 200
         assert stored.content == source[item["sha256"]]
+        decoded = pydicom.dcmread(tmp_path / expected["relative_path"])
+        rescaled = decoded.pixel_array * float(decoded.RescaleSlope) + float(decoded.RescaleIntercept)
+        assert rescaled.min() == expected["rescaled_min"]
+        assert rescaled.max() == expected["rescaled_max"]

@@ -6,7 +6,7 @@ import {
   WindowLevelTool, ZoomTool, addTool, annotation, init as initTools, utilities as toolUtilities,
 } from "@cornerstonejs/tools";
 import { clinicalApi, type Instance, type PresentationState } from "./clinicalApi";
-import { buildDicomImageIds, dicomLoaderHeaders, orientationLabels, viewerErrorMessage } from "./viewerPolicy";
+import { buildDicomImageIds, dicomLoaderHeaders, orientationLabels, resolveVoiRange, viewerErrorMessage } from "./viewerPolicy";
 
 export type ViewerTool = "window" | "pan" | "zoom" | "length";
 export interface ViewportControls { reset: () => void; setIndex: (index: number) => void }
@@ -95,11 +95,10 @@ export function ClinicalViewport({ instances, initialIndex, activeTool, lengthEn
       const imageIds = buildDicomImageIds(instances, (id) => clinicalApi.dicomUrl(id));
       await viewport.setStack(imageIds, Math.min(initialIndex, imageIds.length - 1));
       if (disposed) return;
+      const voiRange = resolveVoiRange(initialPresentation, instances[Math.min(initialIndex, instances.length - 1)]);
       viewport.setProperties({
         invert: inverted,
-        ...(initialPresentation.window_center !== null && initialPresentation.window_width !== null
-          ? { voiRange: { lower: initialPresentation.window_center - initialPresentation.window_width / 2, upper: initialPresentation.window_center + initialPresentation.window_width / 2 } }
-          : {}),
+        ...(voiRange ? { voiRange } : {}),
       });
       viewport.setZoom(initialPresentation.zoom);
       viewport.setPan([initialPresentation.pan_x, initialPresentation.pan_y]);
